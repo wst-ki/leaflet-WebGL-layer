@@ -1,692 +1,620 @@
-export function registerWebGLWindLayer(l) {
-    l.WindLayer = (l.Layer ? l.Layer : l.Class).extend({
-    options: {
-        displayValues: true,
-        displayOptions: {
-            velocityType: "",
-            displayPosition: "",
-            displayEmptyString: ""
+/**
+ * WebGLWindLayer.js
+ * 修复粒子拖尾闪烁问题和位置绘制问题的版本
+ * 新增功能：支持自定义粒子颜色和大小
+ */
+
+// --- GLSL 着色器源码 ---
+
+const QUAD_VERTEX_SHADER = `#version 300 es
+    in vec2 a_pos;
+    out vec2 v_tex_pos;
+    void main() {
+        v_tex_pos = a_pos;
+        gl_Position = vec4(1.0 - 2.0 * a_pos, 0, 1);
+    }
+`;
+
+const SCREEN_FRAGMENT_SHADER = `#version 300 es
+    precision mediump float;
+    uniform sampler2D u_screen;
+    uniform float u_opacity;
+    in vec2 v_tex_pos;
+    out vec4 outColor;
+    void main() {
+        vec4 color = texture(u_screen, v_tex_pos);
+        outColor = vec4(color.rgb, color.a * u_opacity);
+    }
+`;
+
+const DRAW_VERTEX_SHADER = `#version 300 es
+    precision mediump float;
+
+    uniform mat3 u_matrix;
+    uniform sampler2D u_particles;
+    uniform float u_particle_res;
+    uniform float u_particle_size; // 新增：粒子大小
+
+    in float a_index;
+    out vec2 v_particle_pos;
+
+    #define PI 3.141592653589793
+
+    vec2 project(vec2 lonlat) {
+        float lon_rad = radians(lonlat.x);
+        float lat_rad = radians(lonlat.y);
+        return vec2(
+            lon_rad,
+            log(tan(PI / 4.0 + lat_rad / 2.0))
+        );
+    }
+
+    void main() {
+        vec4 color = texture(u_particles, vec2(
+            fract(a_index / u_particle_res),
+            floor(a_index / u_particle_res) / u_particle_res
+        ));
+        
+        v_particle_pos = color.xy;
+        
+        vec2 projected_pos = project(v_particle_pos);
+        
+        vec3 transformed = u_matrix * vec3(projected_pos, 1.0);
+        gl_Position = vec4(transformed.xy, 0.0, 1.0);
+        gl_PointSize = u_particle_size; // 修改：使用 uniform 变量
+    }
+`;
+
+const DRAW_FRAGMENT_SHADER = `#version 300 es
+    precision mediump float;
+
+    uniform sampler2D u_wind;
+    uniform vec2 u_wind_min;
+    uniform vec2 u_wind_max;
+
+    // 新增：颜色相关的 uniforms
+    uniform vec3 u_color1;
+    uniform vec3 u_color2;
+    uniform float u_is_gradient; // 用 float 模拟 bool (1.0 for true, 0.0 for false)
+
+    in vec2 v_particle_pos;
+    out vec4 outColor;
+
+    // 移除旧的 getColorRamp 函数
+
+    void main() {
+        vec2 tex_coord = (v_particle_pos - u_wind_min) / (u_wind_max - u_wind_min);
+        
+        if (tex_coord.x < 0.0 || tex_coord.x > 1.0 || tex_coord.y < 0.0 || tex_coord.y > 1.0) {
+            discard;
+        }
+        
+        vec2 wind = texture(u_wind, tex_coord).rg;
+        float speed = length(wind);
+        float normalized_speed = clamp(speed / 15.0, 0.0, 1.0);
+        
+        vec3 final_color;
+        // 修改：根据 uniform 决定颜色计算方式
+        if (u_is_gradient > 0.5) {
+            final_color = mix(u_color1, u_color2, normalized_speed);
+        } else {
+            final_color = u_color1;
+        }
+        
+        outColor = vec4(final_color, 0.8);
+    }
+`;
+
+const UPDATE_FRAGMENT_SHADER = `#version 300 es
+    precision highp float;
+
+    uniform sampler2D u_particles;
+    uniform sampler2D u_wind;
+    uniform vec2 u_wind_min;
+    uniform vec2 u_wind_max;
+    uniform float u_speed_factor;
+    uniform float u_drop_rate;
+    uniform float u_rand_seed;
+
+    in vec2 v_tex_pos;
+    out vec4 outColor;
+
+    float rand(vec2 co) {
+        return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453 + u_rand_seed);
+    }
+
+    void main() {
+        vec4 state = texture(u_particles, v_tex_pos);
+        vec2 pos = state.xy;
+        
+        vec2 tex_coord = (pos - u_wind_min) / (u_wind_max - u_wind_min);
+        
+        if (tex_coord.x < 0.0 || tex_coord.x > 1.0 || tex_coord.y < 0.0 || tex_coord.y > 1.0 || rand(v_tex_pos) < u_drop_rate) {
+            pos = vec2(
+                u_wind_min.x + rand(v_tex_pos) * (u_wind_max.x - u_wind_min.x),
+                u_wind_min.y + rand(v_tex_pos + 0.1) * (u_wind_max.y - u_wind_min.y)
+            );
+        } else {
+            vec2 wind = texture(u_wind, tex_coord).rg;
+            float lat_rad = radians(pos.y);
+            pos.x += wind.x * u_speed_factor / cos(lat_rad);
+            pos.y += wind.y * u_speed_factor;
+        }
+        
+        outColor = vec4(pos, 0.0, 1.0);
+    }
+`;
+
+/**
+ * 注册 WebGLWindLayer 插件
+ * @param {object} L - Leaflet 主对象
+ */
+export function registerWebGLWindLayer(L) {
+    const WebGLWindLayer = L.Layer.extend({
+        options: {
+            particleCount: 32768,
+            speedFactor: 0.8,
+            dropRate: 0.003,
+            fadeOpacity: 0.96,
+            // 新增：样式选项
+            particleSize: 2.0,
+            color: ['#00FFFF', '#FF0000'] // 默认从青色到红色的渐变
         },
-        maxVelocity: 10,
-        data: null,
-        zIndex: 0,
-        magnification: 1,
-        uvExaggerate: 1,
-        color: ["rgba(250,250,250,0.9)"],
-        velocityScale: 0.005,
-        globalAlpha: 0.9,
-        particleAge: 30,
-        particleMultiplier: 350,
-        frame_rate: 30,
-        lineWidth: 1,
-        type: "wind",
-        particle: true,
-        arrow: true,
-        callback: null,
-        uData: null,
-        vData: null,
-        range: {
-            scale: 0,
-            startLat: 0,
-            startLon: 0,
-            endLon: 0,
-            endLat: 0,
-            width: 0,
-            height: 0
-        }
-    },
 
-    _map: null,
-    _canvasLayer: null,
-    _webglRenderer: null,
-    _context: null,
-    _timer: 0,
-    _mouseControl: null,
-    _animationId: null,
+        initialize: function(windData, options) {
+            L.setOptions(this, options);
+            this._windData = windData;
+            this._programs = {};
+            this._textures = {};
+            this._buffers = {};
+            this._framebuffers = {};
+            this._matrix = new Float32Array(9);
+            this._processColorOption(); // 初始化时处理颜色
+        },
 
-    initialize: function(options) {
-        l.setOptions(this, options);
-    },
+        onAdd: function(map) {
+            this._map = map;
+            this._canvas = L.DomUtil.create('canvas', 'leaflet-wind-layer leaflet-layer');
+            this.getPane().appendChild(this._canvas);
 
-    onAdd: function(map) {
-        this._canvasLayer = l.canvasLayer(this.options).delegate(this);
-        this._canvasLayer.addTo(map);
-        this._map = map;
-    },
-
-    onRemove: function() {
-        this._destroyWind();
-    },
-
-    setData: function(data) {
-        this.options.data = data;
-        try {
-            if (this._webglRenderer) {
-                this._webglRenderer.setData(data);
-                this._clearAndRestart();
-            }
-            this.fire("load");
-        } catch (e) {
-            console.error("Error setting data:", e);
-        }
-    },
-
-    imgCanvas: document.createElement("canvas"),
-    imgData: null,
-
-    setDataP: function() {
-        const self = this;
-        const headerU = {
-            lo1: self.options.range.startLon,
-            la1: self.options.range.startLat,
-            d: self.options.range.scale,
-            nx: self.options.range.width,
-            ny: self.options.range.height,
-            nodata: -999,
-            dataType: "windU"
-        };
-        const headerV = {
-            lo1: self.options.range.startLon,
-            la1: self.options.range.startLat,
-            d: self.options.range.scale,
-            nx: self.options.range.width,
-            ny: self.options.range.height,
-            nodata: -999,
-            dataType: "windV"
-        };
-        const data = [{
-            header: headerU,
-            data: self.options.uData
-        }, {
-            header: headerV,
-            data: self.options.vData
-        }];
-        
-        self.options.data = data;
-        if (self._webglRenderer) {
-            self._webglRenderer.setData(data);
-            self._clearAndRestart();
-        }
-        self.fire("load");
-    },
-
-    drawArrow: function() {
-        if (!this._webglRenderer) return;
-        this._webglRenderer.drawArrows();
-    },
-
-    onDrawLayer: function() {
-        const self = this;
-        if (!this._webglRenderer) {
-            this._initWebGL();
-            if (self.options.data && self._webglRenderer) {
-                self._webglRenderer.setData(self.options.data);
-            }
-            return;
-        }
-
-        if (this.options.data) {
-            if (this._timer) clearTimeout(self._timer);
-            if (self.options.data.length !== 0) {
-                self.CalcurrentRegion();
-                self._clearAndRestart();
-            }
-        }
-    },
-
-    CalcurrentRegion: function() {
-        const bounds = this._map.getBounds();
-        const mapSize = this._map.getSize();
-        const boundsWidth = this._map.distance(
-            [bounds._southWest.lat, bounds._southWest.lng], 
-            [bounds._southWest.lat, bounds._northEast.lng]
-        );
-        const boundsHeight = this._map.distance(
-            [bounds._northEast.lat, bounds._southWest.lng], 
-            [bounds._southWest.lat, bounds._southWest.lng]
-        );
-        const currentArea = boundsWidth * boundsHeight;
-        
-        const {startLon, startLat, endLon, endLat} = this.options.range;
-        const dataWidth = this._map.distance([startLat, startLon], [startLat, endLon]);
-        const dataHeight = this._map.distance([startLat, startLon], [endLat, startLon]);
-        
-        let areaRatio = dataWidth * dataHeight / currentArea * 3;
-        areaRatio = areaRatio > 1 ? 1 : areaRatio;
-        
-        if (this._webglRenderer) {
-            this._webglRenderer.setAreaRatio(areaRatio);
-            this._webglRenderer.setMagnification(this.options.magnification);
-        }
-    },
-
-    _startWindy: function() {
-        const bounds = this._map.getBounds();
-        const size = this._map.getSize();
-        const canvasSize = {
-            width: size.x * this.options.magnification,
-            height: size.y * this.options.magnification
-        };
-        
-        if (this._webglRenderer) {
-            this._webglRenderer.start(canvasSize, bounds);
-            this._animate();
-        }
-    },
-
-    _animate: function() {
-        if (this._webglRenderer && this.options.particle) {
-            this._webglRenderer.render();
-            this._animationId = requestAnimationFrame(() => this._animate());
-        }
-    },
-
-    _initWebGL: function() {
-        const self = this;
-        const canvas = self._canvasLayer._canvas;
-        
-        try {
-            this._webglRenderer = new WebGLWindRenderer({
-                canvas: canvas,
-                options: self.options
+            const gl = this._canvas.getContext('webgl2', { 
+                antialias: false,
+                alpha: true,
+                preserveDrawingBuffer: false
             });
             
-            canvas.classList.add("velocity-overlay");
-            this.onDrawLayer();
-            
-            this._map.on("dragend", () => self._webglRenderer.clearCanvas());
-            this._map.on("zoomstart", () => self._webglRenderer.clearCanvas());
-            this._map.on("resize", () => self._clearWind());
-            
-            this._initMouseHandler();
-        } catch (error) {
-            console.error("WebGL initialization failed:", error);
-        }
-    },
-
-    _initMouseHandler: function() {
-        if (!this._mouseControl && this.options.displayValues) {
-            const displayOptions = this.options.displayOptions || {};
-            displayOptions.leafletVelocity = this;
-            this._mouseControl = l.control.velocity(displayOptions).addTo(this._map);
-        }
-    },
-
-    _clearAndRestart: function() {
-        this.CalcurrentRegion();
-        
-        if (this._animationId) {
-            cancelAnimationFrame(this._animationId);
-            this._animationId = null;
-        }
-        
-        if (this._webglRenderer) {
-            this._webglRenderer.clear();
-        }
-        
-        if (this.options.particle && this._webglRenderer) {
-            this._startWindy();
-        }
-        
-        if (this.options.arrow) {
-            this.drawArrow();
-        }
-    },
-
-    changeParamesReset: function(params) {
-        const self = this;
-        
-        if (params.color) {
-            self.options.color = params.color;
-            if (self._webglRenderer) self._webglRenderer.setColor(params.color);
-        }
-        
-        if (params.velocityScale) {
-            self.options.velocityScale = params.velocityScale;
-            if (self._webglRenderer) self._webglRenderer.setVelocityScale(params.velocityScale);
-        }
-        
-        if (params.globalAlpha) {
-            self.options.globalAlpha = params.globalAlpha;
-            if (self._webglRenderer) self._webglRenderer.setGlobalAlpha(params.globalAlpha);
-        }
-        
-        if (params.particleAge) {
-            self.options.particleAge = params.particleAge;
-            if (self._webglRenderer) self._webglRenderer.setParticleAge(params.particleAge);
-        }
-        
-        if (params.particleMultiplier) {
-            self.options.particleMultiplier = params.particleMultiplier;
-            if (self._webglRenderer) self._webglRenderer.setParticleCount(params.particleMultiplier);
-        }
-        
-        if (params.frame_rate) {
-            self.options.frame_rate = params.frame_rate;
-            if (self._webglRenderer) self._webglRenderer.setFrameRate(params.frame_rate);
-        }
-        
-        if (params.lineWidth) {
-            self.options.lineWidth = params.lineWidth;
-            if (self._webglRenderer) self._webglRenderer.setLineWidth(params.lineWidth);
-        }
-        
-        if (typeof params.arrow === "boolean") {
-            self.options.arrow = params.arrow;
-        }
-        
-        if (typeof params.particle === "boolean") {
-            self.options.particle = params.particle;
-        }
-        
-        if (self._webglRenderer) {
-            self._clearAndRestart();
-        }
-    },
-
-    _clearWind: function() {
-        if (this._animationId) {
-            cancelAnimationFrame(this._animationId);
-            this._animationId = null;
-        }
-        
-        if (this._webglRenderer) {
-            this._webglRenderer.stop();
-            this._webglRenderer.clear();
-        }
-    },
-
-    _destroyWind: function() {
-        if (this._timer) clearTimeout(this._timer);
-        
-        this._clearWind();
-        
-        if (this._mouseControl && this._map) {
-            this._map.removeControl(this._mouseControl);
-        }
-        this._mouseControl = null;
-        
-        if (this._webglRenderer) {
-            this._webglRenderer.dispose();
-            this._webglRenderer = null;
-        }
-        
-        if (this._canvasLayer && this._map) {
-            this._map.removeLayer(this._canvasLayer);
-        }
-    },
-
-    _changetimeredraw: function() {
-        if (this._timer) clearTimeout(this._timer);
-        this._clearWind();
-        
-        if (this._mouseControl && this._map) {
-            this._map.removeControl(this._mouseControl);
-        }
-        this._mouseControl = null;
-        
-        this.setDataP();
-    }
-});
-
-// WebGL渲染器类
-class WebGLWindRenderer {
-    constructor({canvas, options}) {
-        this.canvas = canvas;
-        this.options = options;
-        this.gl = null;
-        this.program = null;
-        this.particleProgram = null;
-        this.arrowProgram = null;
-        this.windData = null;
-        this.particles = [];
-        this.particleCount = options.particleMultiplier || 350;
-        this.frameRate = 1000 / (options.frame_rate || 30);
-        this.lastFrameTime = 0;
-        
-        this._initWebGL();
-        this._createShaders();
-        this._initParticles();
-    }
-
-    _initWebGL() {
-        this.gl = this.canvas.getContext('webgl') || this.canvas.getContext('experimental-webgl');
-        if (!this.gl) {
-            throw new Error('WebGL not supported');
-        }
-        
-        this.gl.enable(this.gl.BLEND);
-        this.gl.blendFunc(this.gl.SRC_ALPHA, this.gl.ONE_MINUS_SRC_ALPHA);
-    }
-
-    _createShaders() {
-        // 粒子顶点着色器
-        const particleVertexShader = `
-            attribute vec2 a_position;
-            attribute vec2 a_velocity;
-            attribute float a_age;
-            
-            uniform vec2 u_resolution;
-            uniform float u_time;
-            uniform float u_particleAge;
-            
-            varying float v_alpha;
-            
-            void main() {
-                vec2 pos = a_position + a_velocity * u_time;
-                gl_Position = vec4((pos / u_resolution) * 2.0 - 1.0, 0.0, 1.0);
-                gl_Position.y = -gl_Position.y;
-                
-                v_alpha = 1.0 - (a_age / u_particleAge);
-                gl_PointSize = 2.0;
+            if (!gl || !gl.getExtension('EXT_color_buffer_float')) {
+                throw new Error('WebGL 2 or required extensions not supported');
             }
-        `;
+            
+            this._gl = gl;
+            this._initGL();
+            this._resize();
+            
+            map.on('moveend', this._update, this);
+            map.on('zoomend', this._update, this);  
+            map.on('resize', this._resize, this);
+            map.on('move', this._updateMatrix, this);
+            
+            this._frame();
+        },
 
-        // 粒子片段着色器
-        const particleFragmentShader = `
-            precision mediump float;
-            
-            uniform vec3 u_color;
-            uniform float u_globalAlpha;
-            
-            varying float v_alpha;
-            
-            void main() {
-                gl_FragColor = vec4(u_color, v_alpha * u_globalAlpha);
+        onRemove: function(map) {
+            if (this._canvas && this._canvas.parentNode) {
+                this._canvas.parentNode.removeChild(this._canvas);
             }
-        `;
-
-        // 箭头顶点着色器
-        const arrowVertexShader = `
-            attribute vec2 a_position;
+            map.off('moveend', this._update, this);
+            map.off('zoomend', this._update, this);
+            map.off('resize', this._resize, this);
+            map.off('move', this._updateMatrix, this);
             
-            uniform vec2 u_resolution;
-            uniform mat3 u_transform;
-            
-            void main() {
-                vec3 pos = u_transform * vec3(a_position, 1.0);
-                gl_Position = vec4((pos.xy / u_resolution) * 2.0 - 1.0, 0.0, 1.0);
-                gl_Position.y = -gl_Position.y;
+            if (this._animationFrame) {
+                cancelAnimationFrame(this._animationFrame);
             }
-        `;
+        },
 
-        // 箭头片段着色器
-        const arrowFragmentShader = `
-            precision mediump float;
+        // --- 新增公共方法 ---
+        setColor: function(color) {
+            this.options.color = color;
+            this._processColorOption();
+            return this;
+        },
+
+        setParticleSize: function(size) {
+            this.options.particleSize = size;
+            return this;
+        },
+        // --- ---
+
+        _initGL: function() {
+            const gl = this._gl;
+            this._programs.draw = this._createProgram(DRAW_VERTEX_SHADER, DRAW_FRAGMENT_SHADER);
+            this._programs.update = this._createProgram(QUAD_VERTEX_SHADER, UPDATE_FRAGMENT_SHADER);
+            this._programs.screen = this._createProgram(QUAD_VERTEX_SHADER, SCREEN_FRAGMENT_SHADER);
+
+            this._buffers.quad = this._createBuffer(new Float32Array([0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1]));
+            this._createWindTexture();
+            this._createParticleTextures();
+            this._createParticleIndexBuffer();
+            this._createFramebuffers();
+            this._createScreenFramebuffer();
+        },
+        
+        _drawParticles: function() {
+            const gl = this._gl;
+            const program = this._programs.draw;
             
-            uniform vec3 u_color;
-            uniform float u_alpha;
+            gl.useProgram(program.program);
             
-            void main() {
-                gl_FragColor = vec4(u_color, u_alpha);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+            this._bindAttribute(this._buffers.particleIndex, program.a_index, 1);
+            
+            this._bindTexture(this._textures.particles1, 0);
+            this._bindTexture(this._textures.wind, 1);
+            
+            gl.uniform1i(program.u_particles, 0);
+            gl.uniform1i(program.u_wind, 1);
+            
+            const [minLon, minLat, maxLon, maxLat] = this._windData.bounds;
+            gl.uniform2f(program.u_wind_min, minLon, minLat);
+            gl.uniform2f(program.u_wind_max, maxLon, maxLat);
+            gl.uniform1f(program.u_particle_res, this._particleStateResolution);
+            
+            this._updateMatrix();
+            gl.uniformMatrix3fv(program.u_matrix, false, this._matrix);
+
+            // 新增：传递样式 uniforms
+            gl.uniform1f(program.u_particle_size, this.options.particleSize);
+            gl.uniform3fv(program.u_color1, this._color1);
+            gl.uniform3fv(program.u_color2, this._color2);
+            gl.uniform1f(program.u_is_gradient, this._isGradient ? 1.0 : 0.0);
+            
+            gl.drawArrays(gl.POINTS, 0, this._particleStateResolution * this._particleStateResolution);
+            gl.disable(gl.BLEND);
+        },
+        
+        // 新增：处理颜色选项的内部函数
+        _processColorOption: function() {
+            function hexToRgb(hex) {
+                if (hex.startsWith('#')) hex = hex.substring(1);
+                const bigint = parseInt(hex, 16);
+                const r = (bigint >> 16) & 255;
+                const g = (bigint >> 8) & 255;
+                const b = bigint & 255;
+                return [r / 255, g / 255, b / 255];
             }
-        `;
 
-        this.particleProgram = this._createProgram(particleVertexShader, particleFragmentShader);
-        this.arrowProgram = this._createProgram(arrowVertexShader, arrowFragmentShader);
-    }
-
-    _createProgram(vertexSource, fragmentSource) {
-        const vertexShader = this._createShader(this.gl.VERTEX_SHADER, vertexSource);
-        const fragmentShader = this._createShader(this.gl.FRAGMENT_SHADER, fragmentSource);
-        
-        const program = this.gl.createProgram();
-        this.gl.attachShader(program, vertexShader);
-        this.gl.attachShader(program, fragmentShader);
-        this.gl.linkProgram(program);
-        
-        if (!this.gl.getProgramParameter(program, this.gl.LINK_STATUS)) {
-            throw new Error('Program link error: ' + this.gl.getProgramInfoLog(program));
-        }
-        
-        return program;
-    }
-
-    _createShader(type, source) {
-        const shader = this.gl.createShader(type);
-        this.gl.shaderSource(shader, source);
-        this.gl.compileShader(shader);
-        
-        if (!this.gl.getShaderParameter(shader, this.gl.COMPILE_STATUS)) {
-            throw new Error('Shader compile error: ' + this.gl.getShaderInfoLog(shader));
-        }
-        
-        return shader;
-    }
-
-    _initParticles() {
-        this.particles = [];
-        for (let i = 0; i < this.particleCount; i++) {
-            this.particles.push({
-                x: Math.random() * this.canvas.width,
-                y: Math.random() * this.canvas.height,
-                vx: 0,
-                vy: 0,
-                age: Math.random() * this.options.particleAge
-            });
-        }
-    }
-
-    setData(data) {
-        this.windData = data;
-        this._processWindData();
-    }
-
-    _processWindData() {
-        if (!this.windData || this.windData.length < 2) return;
-        
-        const uData = this.windData[0].data;
-        const vData = this.windData[1].data;
-        const header = this.windData[0].header;
-        
-        this.windGrid = {
-            data: { u: uData, v: vData },
-            width: header.nx,
-            height: header.ny,
-            startLon: header.lo1,
-            startLat: header.la1,
-            scale: header.d
-        };
-    }
-
-    _getWindAt(x, y) {
-        if (!this.windGrid) return {u: 0, v: 0};
-        
-        // 将屏幕坐标转换为地理坐标，然后转换为网格索引
-        // 这里需要根据具体的地图投影进行转换
-        const gridX = Math.floor(x / this.canvas.width * this.windGrid.width);
-        const gridY = Math.floor(y / this.canvas.height * this.windGrid.height);
-        
-        if (gridX < 0 || gridX >= this.windGrid.width || gridY < 0 || gridY >= this.windGrid.height) {
-            return {u: 0, v: 0};
-        }
-        
-        const index = gridY * this.windGrid.width + gridX;
-        return {
-            u: this.windGrid.data.u[index] || 0,
-            v: this.windGrid.data.v[index] || 0
-        };
-    }
-
-    render() {
-        const currentTime = Date.now();
-        if (currentTime - this.lastFrameTime < this.frameRate) return;
-        this.lastFrameTime = currentTime;
-        
-        this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-        this.gl.clear(this.gl.COLOR_BUFFER_BIT);
-        
-        if (this.options.particle) {
-            this._renderParticles();
-        }
-    }
-
-    _renderParticles() {
-        // 更新粒子位置
-        this.particles.forEach(particle => {
-            const wind = this._getWindAt(particle.x, particle.y);
-            particle.vx = wind.u * this.options.velocityScale;
-            particle.vy = wind.v * this.options.velocityScale;
-            
-            particle.x += particle.vx;
-            particle.y += particle.vy;
-            particle.age++;
-            
-            // 重置超出边界或生命周期结束的粒子
-            if (particle.x < 0 || particle.x > this.canvas.width || 
-                particle.y < 0 || particle.y > this.canvas.height || 
-                particle.age > this.options.particleAge) {
-                particle.x = Math.random() * this.canvas.width;
-                particle.y = Math.random() * this.canvas.height;
-                particle.age = 0;
+            const colorOpt = this.options.color;
+            if (typeof colorOpt === 'string') {
+                this._isGradient = false;
+                this._color1 = hexToRgb(colorOpt);
+                this._color2 = [0, 0, 0]; // 未使用，但需要一个值
+            } else if (Array.isArray(colorOpt)) {
+                if (colorOpt.length === 1) {
+                    this._isGradient = false;
+                    this._color1 = hexToRgb(colorOpt[0]);
+                    this._color2 = [0, 0, 0];
+                } else if (colorOpt.length >= 2) {
+                    this._isGradient = true;
+                    this._color1 = hexToRgb(colorOpt[0]);
+                    this._color2 = hexToRgb(colorOpt[1]);
+                }
+            } else { // 默认回退
+                this._isGradient = true;
+                this._color1 = [0.0, 1.0, 1.0]; // Cyan
+                this._color2 = [1.0, 0.0, 0.0]; // Red
             }
-        });
+        },
+        
+        _project: function(lat, lon) {
+            const d = Math.PI / 180;
+            const lat_rad = lat * d;
+            const lon_rad = lon * d;
+            const y = Math.log(Math.tan((Math.PI / 4) + (lat_rad / 2)));
+            return [lon_rad, y];
+        },
 
-        // 渲染粒子
-        this.gl.useProgram(this.particleProgram);
-        
-        // 创建位置缓冲区
-        const positions = new Float32Array(this.particles.length * 2);
-        const ages = new Float32Array(this.particles.length);
-        
-        this.particles.forEach((particle, i) => {
-            positions[i * 2] = particle.x;
-            positions[i * 2 + 1] = particle.y;
-            ages[i] = particle.age;
-        });
-        
-        // 位置属性
-        const positionBuffer = this.gl.createBuffer();
-        this.gl.bindBuffer(this.gl.ARRAY_BUFFER, positionBuffer);
-        this.gl.bufferData(this.gl.ARRAY_BUFFER, positions, this.gl.DYNAMIC_DRAW);
-        
-        const positionLocation = this.gl.getAttribLocation(this.particleProgram, 'a_position');
-        this.gl.enableVertexAttribArray(positionLocation);
-        this.gl.vertexAttribPointer(positionLocation, 2, this.gl.FLOAT, false, 0, 0);
-        
-        // 年龄属性
-        const ageBuffer = this.gl.createBuffer();
-        this.gl.bindBuffer(this.gl.ARRAY_BUFFER, ageBuffer);
-        this.gl.bufferData(this.gl.ARRAY_BUFFER, ages, this.gl.DYNAMIC_DRAW);
-        
-        const ageLocation = this.gl.getAttribLocation(this.particleProgram, 'a_age');
-        this.gl.enableVertexAttribArray(ageLocation);
-        this.gl.vertexAttribPointer(ageLocation, 1, this.gl.FLOAT, false, 0, 0);
-        
-        // 设置uniform
-        const resolutionLocation = this.gl.getUniformLocation(this.particleProgram, 'u_resolution');
-        this.gl.uniform2f(resolutionLocation, this.canvas.width, this.canvas.height);
-        
-        const colorLocation = this.gl.getUniformLocation(this.particleProgram, 'u_color');
-        const color = this._parseColor(this.options.color[0]);
-        this.gl.uniform3f(colorLocation, color.r, color.g, color.b);
-        
-        const alphaLocation = this.gl.getUniformLocation(this.particleProgram, 'u_globalAlpha');
-        this.gl.uniform1f(alphaLocation, this.options.globalAlpha);
-        
-        const particleAgeLocation = this.gl.getUniformLocation(this.particleProgram, 'u_particleAge');
-        this.gl.uniform1f(particleAgeLocation, this.options.particleAge);
-        
-        this.gl.drawArrays(this.gl.POINTS, 0, this.particles.length);
-    }
+        // --- 以下是未修改的函数 ---
 
-    drawArrows() {
-        // 箭头绘制实现
-        if (!this.windGrid) return;
+        _draw: function() {
+            const gl = this._gl;
+            if (!gl) return;
+            
+            this._updateParticles();
+            this._drawScreen();
+            this._swapParticleTextures();
+        },
+
+        _drawScreen: function() {
+            const gl = this._gl;
+            
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this._framebuffers.temp);
+            gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            
+            this._drawTexture(this._textures.screen, this.options.fadeOpacity);
+            this._drawParticles();
+            
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this._framebuffers.screen);
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            this._drawTexture(this._textures.temp, 1.0);
+            
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+            this._drawTexture(this._textures.screen, 1.0);
+            gl.disable(gl.BLEND);
+        },
+
+        _drawTexture: function(texture, opacity) {
+            const gl = this._gl;
+            const program = this._programs.screen;
+            gl.useProgram(program.program);
+
+            this._bindAttribute(this._buffers.quad, program.a_pos, 2);
+            this._bindTexture(texture, 0);
+            gl.uniform1i(program.u_screen, 0);
+            gl.uniform1f(program.u_opacity, opacity);
+
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+        },
+
+        _swapParticleTextures: function() {
+            [this._textures.particles0, this._textures.particles1] = [this._textures.particles1, this._textures.particles0];
+            [this._framebuffers.particles0, this._framebuffers.particles1] = [this._framebuffers.particles1, this._framebuffers.particles0];
+        },
         
-        this.gl.useProgram(this.arrowProgram);
+        _resize: function() {
+            const canvas = this._canvas;
+            const mapSize = this._map.getSize();
+            
+            if (canvas.width !== mapSize.x || canvas.height !== mapSize.y) {
+                canvas.width = mapSize.x;
+                canvas.height = mapSize.y;
+                this._createScreenFramebuffer();
+            }
+            
+            this._gl.viewport(0, 0, canvas.width, canvas.height);
+            
+            const pos = this._map.containerPointToLayerPoint([0, 0]);
+            L.DomUtil.setPosition(this._canvas, pos);
+        },
+
+        _createScreenFramebuffer: function() {
+            const gl = this._gl;
+            const emptyPixels = new Uint8Array(gl.canvas.width * gl.canvas.height * 4);
+            
+            if (this._textures.screen) gl.deleteTexture(this._textures.screen);
+            if (this._textures.temp) gl.deleteTexture(this._textures.temp);
+            if (this._framebuffers.screen) gl.deleteFramebuffer(this._framebuffers.screen);
+            if (this._framebuffers.temp) gl.deleteFramebuffer(this._framebuffers.temp);
+            
+            this._textures.screen = this._createTexture(gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gl.canvas.width, gl.canvas.height, emptyPixels);
+            this._textures.temp = this._createTexture(gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gl.canvas.width, gl.canvas.height, emptyPixels);
+            
+            this._framebuffers.screen = this._createFramebuffer(this._textures.screen);
+            this._framebuffers.temp = this._createFramebuffer(this._textures.temp);
+        },
         
-        // 简化的箭头绘制逻辑
-        const arrowSpacing = 50;
-        const arrows = [];
-        
-        for (let x = 0; x < this.canvas.width; x += arrowSpacing) {
-            for (let y = 0; y < this.canvas.height; y += arrowSpacing) {
-                const wind = this._getWindAt(x, y);
-                if (Math.abs(wind.u) > 0.01 || Math.abs(wind.v) > 0.01) {
-                    arrows.push({x, y, u: wind.u, v: wind.v});
+        _createWindTexture: function() {
+            const gl = this._gl;
+            const { u, v, width, height } = this._windData;
+            const windFloats = new Float32Array(u.length * 2);
+            
+            for (let j = 0; j < height; j++) {
+                for (let i = 0; i < width; i++) {
+                    const sourceIndex = j * width + i;
+                    const targetRow = height - 1 - j;
+                    const targetIndex = targetRow * width + i;
+                    windFloats[targetIndex * 2] = u[sourceIndex];
+                    windFloats[targetIndex * 2 + 1] = v[sourceIndex];
                 }
             }
-        }
+            
+            this._textures.wind = this._createTexture(
+                gl.RG32F, gl.RG, gl.FLOAT, 
+                width, height, 
+                windFloats
+            );
+        },
+
+        _createParticleTextures: function() {
+            const gl = this._gl;
+            const particleRes = Math.ceil(Math.sqrt(this.options.particleCount));
+            this._particleStateResolution = particleRes;
+            
+            const particleState = new Float32Array(particleRes * particleRes * 4);
+            const [minLon, minLat, maxLon, maxLat] = this._windData.bounds;
+            
+            for (let i = 0; i < particleState.length; i += 4) {
+                particleState[i] = minLon + Math.random() * (maxLon - minLon);
+                particleState[i + 1] = minLat + Math.random() * (maxLat - minLat);
+                particleState[i + 2] = 0.0;
+                particleState[i + 3] = 1.0;
+            }
+            
+            this._textures.particles0 = this._createTexture(
+                gl.RGBA32F, gl.RGBA, gl.FLOAT, 
+                particleRes, particleRes, 
+                particleState
+            );
+            
+            this._textures.particles1 = this._createTexture(
+                gl.RGBA32F, gl.RGBA, gl.FLOAT, 
+                particleRes, particleRes, 
+                null
+            );
+        },
+
+        _createParticleIndexBuffer: function() {
+            const particleRes = this._particleStateResolution;
+            const particleIndices = new Float32Array(particleRes * particleRes);
+            for (let i = 0; i < particleIndices.length; i++) {
+                particleIndices[i] = i;
+            }
+            this._buffers.particleIndex = this._createBuffer(particleIndices);
+        },
+
+        _createFramebuffers: function() {
+            this._framebuffers.particles0 = this._createFramebuffer(this._textures.particles0);
+            this._framebuffers.particles1 = this._createFramebuffer(this._textures.particles1);
+        },
+
+        _updateParticles: function() {
+            const gl = this._gl;
+            const program = this._programs.update;
+            
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this._framebuffers.particles1);
+            gl.viewport(0, 0, this._particleStateResolution, this._particleStateResolution);
+            
+            gl.useProgram(program.program);
+            this._bindAttribute(this._buffers.quad, program.a_pos, 2);
+            
+            this._bindTexture(this._textures.particles0, 0);
+            this._bindTexture(this._textures.wind, 1);
+            
+            gl.uniform1i(program.u_particles, 0);
+            gl.uniform1i(program.u_wind, 1);
+            
+            const [minLon, minLat, maxLon, maxLat] = this._windData.bounds;
+            gl.uniform2f(program.u_wind_min, minLon, minLat);
+            gl.uniform2f(program.u_wind_max, maxLon, maxLat);
+            gl.uniform1f(program.u_speed_factor, this.options.speedFactor * 0.01);
+            gl.uniform1f(program.u_drop_rate, this.options.dropRate);
+            gl.uniform1f(program.u_rand_seed, Math.random());
+            
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+        },
         
-        // 绘制箭头的具体实现
-        // ...
-    }
+        _frame: function() {
+            if (this._map) {
+                this._draw();
+                this._animationFrame = requestAnimationFrame(this._frame.bind(this));
+            }
+        },
 
-    _parseColor(colorStr) {
-        const match = colorStr.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-        if (match) {
-            return {
-                r: parseInt(match[1]) / 255,
-                g: parseInt(match[2]) / 255,
-                b: parseInt(match[3]) / 255
-            };
+        _updateMatrix: function() {
+            const mapBounds = this._map.getBounds();
+            const ne = mapBounds.getNorthEast();
+            const sw = mapBounds.getSouthWest();
+
+            const [ne_x, ne_y] = this._project(ne.lat, ne.lng);
+            const [sw_x, sw_y] = this._project(sw.lat, sw.lng);
+
+            const scale_x = 2.0 / (ne_x - sw_x);
+            const offset_x = -(ne_x + sw_x) / (ne_x - sw_x);
+
+            const scale_y = 2.0 / (ne_y - sw_y);
+            const offset_y = -(ne_y + sw_y) / (ne_y - sw_y);
+
+            this._matrix.set([
+                scale_x, 0, 0,
+                0, scale_y, 0,
+                offset_x, offset_y, 1
+            ]);
+        },
+
+        _update: function() {
+            this._updateMatrix();
+            this._resize();
+        },
+        
+        _createProgram: function(vertSrc, fragSrc) {
+            const gl = this._gl;
+            const vertShader = this._createShader(gl.VERTEX_SHADER, vertSrc);
+            const fragShader = this._createShader(gl.FRAGMENT_SHADER, fragSrc);
+            const program = gl.createProgram();
+            
+            gl.attachShader(program, vertShader);
+            gl.attachShader(program, fragShader);
+            gl.linkProgram(program);
+            
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                throw new Error('Program link error: ' + gl.getProgramInfoLog(program));
+            }
+            
+            const wrapper = { program };
+            const numAttributes = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES);
+            for (let i = 0; i < numAttributes; i++) {
+                const attribute = gl.getActiveAttrib(program, i);
+                wrapper[attribute.name] = gl.getAttribLocation(program, attribute.name);
+            }
+            const numUniforms = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+            for (let i = 0; i < numUniforms; i++) {
+                const uniform = gl.getActiveUniform(program, i);
+                wrapper[uniform.name] = gl.getUniformLocation(program, uniform.name);
+            }
+            return wrapper;
+        },
+
+        _createShader: function(type, source) {
+            const gl = this._gl;
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                throw new Error('Shader compile error: ' + gl.getShaderInfoLog(shader));
+            }
+            return shader;
+        },
+
+        _createBuffer: function(data) {
+            const gl = this._gl;
+            const buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+            return buffer;
+        },
+
+        _createTexture: function(internalFormat, format, type, width, height, data) {
+            const gl = this._gl;
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, width, height, 0, format, type, data);
+            return texture;
+        },
+
+        _bindTexture: function(texture, unit) {
+            const gl = this._gl;
+            gl.activeTexture(gl.TEXTURE0 + unit);
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+        },
+
+        _bindAttribute: function(buffer, attribute, numComponents) {
+            const gl = this._gl;
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            gl.vertexAttribPointer(attribute, numComponents, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(attribute);
+        },
+
+        _createFramebuffer: function(texture) {
+            const gl = this._gl;
+            const fbo = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+            
+            if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+                throw new Error('Framebuffer not complete');
+            }
+            
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            return fbo;
         }
-        return {r: 1, g: 1, b: 1};
-    }
+    });
 
-    start(canvasSize, bounds) {
-        this.canvas.width = canvasSize.width;
-        this.canvas.height = canvasSize.height;
-        this.bounds = bounds;
-    }
+    L.webGLWindLayer = function(windData, options) {
+        return new WebGLWindLayer(windData, options);
+    };
 
-    stop() {
-        // 停止渲染
-    }
-
-    clear() {
-        if (this.gl) {
-            this.gl.clear(this.gl.COLOR_BUFFER_BIT);
-        }
-    }
-
-    clearCanvas() {
-        this.clear();
-    }
-
-    setAreaRatio(ratio) {
-        this.areaRatio = ratio;
-    }
-
-    setMagnification(mag) {
-        this.magnification = mag;
-    }
-
-    setColor(color) {
-        this.options.color = color;
-    }
-
-    setVelocityScale(scale) {
-        this.options.velocityScale = scale;
-    }
-
-    setGlobalAlpha(alpha) {
-        this.options.globalAlpha = alpha;
-    }
-
-    setParticleAge(age) {
-        this.options.particleAge = age;
-    }
-
-    setParticleCount(count) {
-        this.particleCount = count;
-        this._initParticles();
-    }
-
-    setFrameRate(rate) {
-        this.frameRate = 1000 / rate;
-    }
-
-    setLineWidth(width) {
-        this.options.lineWidth = width;
-    }
-
-    dispose() {
-        if (this.gl) {
-            this.gl.deleteProgram(this.particleProgram);
-            this.gl.deleteProgram(this.arrowProgram);
-        }
-    }
-}
+    L.WebGLWindLayer = WebGLWindLayer;
 }

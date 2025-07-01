@@ -11,6 +11,8 @@ export function registerWebGLScalarLayer(L) {
             labelCell: 64,
             magnification: 1,
             nodata: -999,
+            // todo 可选值: 'nearest', 'bilinear', 'bicubic'
+            interpolation: 'bicubic', // 默认为最高质量的双三次插值
             digit: 1,
             maxLabels: 300,     // 最大标签数量
             labelDensity: 1,    // 标签密度系数 (值越大标签越稀疏)
@@ -89,7 +91,17 @@ export function registerWebGLScalarLayer(L) {
             this.gridData = this.field.grid;
             this.nRows = this.field.nRows;
             this.nCols = this.field.nCols;
-            
+
+            if (this.options.upsampleFactor > 1) {
+                if (interpMethod === 'idw') {
+                    const power = this.options.idwPower || 2; // IDW的p值
+                    const neighbors = this.options.idwNeighbors || 8; // 考虑的邻近点数量
+                    // console.log(`🔍 Upsampling grid with IDW: power=${power}, neighbors=${neighbors}`);
+                    finalGrid = this._upsampleGridIDW(fieldParams.grid, this.options.upsampleFactor, power, neighbors);
+                } else { // 默认为双线性
+                    finalGrid = this._upsampleGridBilinear(fieldParams.grid, this.options.upsampleFactor);
+                }
+            }
             // 用 field 的元数据精确计算 bounds
             const yurCorner = this.field.yllCorner + this.field.nRows * this.field.cellYSize;
             const xurCorner = this.field.xllCorner + this.field.nCols * this.field.cellXSize;
@@ -245,32 +257,42 @@ export function registerWebGLScalarLayer(L) {
 
         // 初始化 WebGL
         _initWebGL: function() {
-            this._gl = this._canvas.getContext('webgl') || this._canvas.getContext('experimental-webgl');
-            
-            if (!this._gl) {
-                console.error('WebGL not supported');
-                return;
-            }
-            
-            const gl = this._gl;
-            
-            // ⭐️ 新增：检查并启用浮点纹理扩展
-            this._floatExtension = gl.getExtension('OES_texture_float');
-            if (!this._floatExtension) {
-                console.warn('Float textures not supported, falling back to UNSIGNED_BYTE');
-                this._useFloatTexture = false;
-            } else {
-                this._useFloatTexture = true;
-                console.log('Float textures supported');
-            }
-            
-            // 启用混合
-            gl.enable(gl.BLEND);
-            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-            
-            // 设置视口
-            gl.viewport(0, 0, this._canvas.width, this._canvas.height);
-        },
+                    this._gl = this._canvas.getContext('webgl') || this._canvas.getContext('experimental-webgl');
+                    
+                    if (!this._gl) {
+                        console.error('WebGL not supported');
+                        return;
+                    }
+                    
+                    const gl = this._gl;
+                    
+                    // 检查浮点纹理支持
+                    if (gl.getExtension('OES_texture_float')) {
+                        this._useFloatTexture = true;
+                        // console.log('✅ Float textures supported (OES_texture_float)');
+
+                        // ⭐️ 关键新增：检查浮点纹理的线性插值支持
+                        if (gl.getExtension('OES_texture_float_linear')) {
+                            this._canLinearFilterFloat = true;
+                            // console.log('✅ Linear filtering for float textures supported (OES_texture_float_linear)');
+                        } else {
+                            this._canLinearFilterFloat = false;
+                            // console.warn('⚠️ Linear filtering for float textures NOT supported. Will fall back to NEAREST.');
+                        }
+
+                    } else {
+                        this._useFloatTexture = false;
+                        this._canLinearFilterFloat = false; // 如果不支持浮点纹理，自然也不支持其线性插值
+                        // console.warn('⚠️ Float textures not supported. Using UNSIGNED_BYTE.');
+                    }
+                    
+                    // 启用混合
+                    gl.enable(gl.BLEND);
+                    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+                    
+                    // 设置视口
+                    gl.viewport(0, 0, this._canvas.width, this._canvas.height);
+                },
 
         // 创建着色器程序
         _createShaders: function() {
@@ -308,84 +330,85 @@ export function registerWebGLScalarLayer(L) {
             // 片段着色器源码
             // 在 fragmentShaderSource 中修改数据解码部分
             // 在 _createShaders 函数内, 替换 fragmentShaderSource 字符串
+            // ⭐️ 方法二：高性能双三次插值着色器
             const fragmentShaderSource = `
                 precision mediump float;
                 
                 uniform sampler2D u_dataTexture;
                 uniform sampler2D u_colorTexture;
+                uniform vec2 u_textureSize; // ⭐️ 新增：数据纹理的尺寸（宽、高）
+
                 uniform float u_opacity;
                 uniform float u_minValue;
                 uniform float u_maxValue;
-                uniform float u_nodata;       // JS options.nodata
-                uniform vec2 u_numRange;      // JS options.numRange
+                uniform float u_nodata;
+                uniform vec2 u_numRange;
                 uniform bool u_showColor;
-                uniform bool u_useFloatTexture;  // ⭐️ 新增uniform
                 
                 varying vec2 v_texCoord;
-                
+
+                // ⭐️ 新增：三次样条插值函数
+                vec4 cubic(float v) {
+                    vec4 n = vec4(1.0, 2.0, 3.0, 4.0) - v;
+                    vec4 s = n * n * n;
+                    float x = s.x;
+                    float y = s.y - 4.0 * s.x;
+                    float z = s.z - 4.0 * s.y + 6.0 * s.x;
+                    float w = 6.0 - x - y - z;
+                    return vec4(x, y, z, w) * (1.0/6.0);
+                }
+
+                // ⭐️ 新增：双三次纹理采样函数
+                float textureBicubic(sampler2D sampler, vec2 texCoords) {
+                    vec2 texelSize = 1.0 / u_textureSize;
+                    vec2 f = fract(texCoords * u_textureSize); // 获取小数部分
+
+                    // 计算16个采样点的坐标
+                    vec2 p0 = texCoords - f * texelSize - texelSize;
+                    vec2 p1 = p0 + texelSize;
+                    vec2 p2 = p1 + texelSize;
+                    vec2 p3 = p2 + texelSize;
+
+                    // 对4行进行三次插值
+                    vec4 c0 = cubic(f.x);
+                    vec4 c1 = cubic(f.x);
+                    vec4 c2 = cubic(f.x);
+                    vec4 c3 = cubic(f.x);
+
+                    vec4 v0 = vec4(texture2D(sampler, vec2(p0.x, p0.y)).r, texture2D(sampler, vec2(p1.x, p0.y)).r, texture2D(sampler, vec2(p2.x, p0.y)).r, texture2D(sampler, vec2(p3.x, p0.y)).r);
+                    vec4 v1 = vec4(texture2D(sampler, vec2(p0.x, p1.y)).r, texture2D(sampler, vec2(p1.x, p1.y)).r, texture2D(sampler, vec2(p2.x, p1.y)).r, texture2D(sampler, vec2(p3.x, p1.y)).r);
+                    vec4 v2 = vec4(texture2D(sampler, vec2(p0.x, p2.y)).r, texture2D(sampler, vec2(p1.x, p2.y)).r, texture2D(sampler, vec2(p2.x, p2.y)).r, texture2D(sampler, vec2(p3.x, p2.y)).r);
+                    vec4 v3 = vec4(texture2D(sampler, vec2(p0.x, p3.y)).r, texture2D(sampler, vec2(p1.x, p3.y)).r, texture2D(sampler, vec2(p2.x, p3.y)).r, texture2D(sampler, vec2(p3.x, p3.y)).r);
+                    
+                    // 对插值后的4行进行加权求和
+                    float r0 = dot(v0, c0);
+                    float r1 = dot(v1, c1);
+                    float r2 = dot(v2, c2);
+                    float r3 = dot(v3, c3);
+
+                    vec4 c = cubic(f.y);
+                    return dot(vec4(r0, r1, r2, r3), c);
+                }
+
                 void main() {
                     if (!u_showColor) {
                         gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
                         return;
                     }
                     
-                    float value;
-
-                    // ⭐️⭐️⭐️ 核心修正区域 START ⭐️⭐️⭐️
-                    // 在 fragmentShaderSource 中，value 采样后立即添加
-                    if (u_useFloatTexture) {
-                        value = texture2D(u_dataTexture, v_texCoord).r;
-                        // 临时调试：显示原始采样值
-                    }else {
-                        // --- 8位整数纹理路径 (解码) ---
-                        // 1. 从纹理中采样8位值 (范围 0.0-1.0)
-                        float byteValueNormalized = texture2D(u_dataTexture, v_texCoord).r;
-                        
-                        // 2. 将其转换回整数值 0-255
-                        float byteValue = byteValueNormalized * 255.0;
-
-                        // 3. 检查是否为我们指定的无效数据标记 (0)
-                        // 使用一个小的容差范围来比较浮点数
-                        if (byteValue < 0.5) { 
-                            gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
-                            return;
-                        }
-
-                        // 4. 将 [1, 255] 的范围重新映射回 [0.0, 1.0] 的归一化值
-                        float normalizedFromByte = (byteValue - 1.0) / 254.0;
-                        
-                        // 5. 使用 min/max 值重建原始数据值
-                        float range = u_maxValue - u_minValue;
-                        value = u_minValue + normalizedFromByte * range;
-                    }
-                    // ⭐️⭐️⭐️ 核心修正区域 END ⭐️⭐️⭐️
-
-                    // 检查无效数据 (与JS中的定义保持一致)
-                    // 使用一个小的容差(epsilon)来比较浮点数是否相等
-                    if (abs(value - u_nodata) < 0.001 || 
-                        value < u_numRange.x || 
-                        value > u_numRange.y) {
+                    // ⭐️ 使用新的双三次采样函数，而不是 texture2D
+                    float value = textureBicubic(u_dataTexture, v_texCoord);
+                    
+                    // --- 后续逻辑保持不变 ---
+                    if (abs(value - u_nodata) < 0.001 || value < u_numRange.x || value > u_numRange.y) {
                         gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
                         return;
                     }
                     
-                    // ⭐️ 修正：将值归一化到 [0, 1] 以便从颜色条中采样
                     float rangeForColor = u_maxValue - u_minValue;
-                    // 避免除以零
-                    if (rangeForColor <= 0.001) {
-                        rangeForColor = 1.0;
-                    }
-                    float normalizedValueForColor = (value - u_minValue) / rangeForColor;
-                    // ⭐️ 确保严格限制在 [0, 1] 范围内
-                    normalizedValueForColor = clamp(normalizedValueForColor, 0.0, 1.0);
-
-                    // ⭐️ 调试输出（可选，帮助诊断）
-                    // 注意：在实际部署时可以移除下面这行
-                    if (gl_FragCoord.x < 10.0 && gl_FragCoord.y < 10.0) {
+                    if (rangeForColor <= 0.001) { rangeForColor = 1.0; }
+                    float normalizedValueForColor = clamp((value - u_minValue) / rangeForColor, 0.0, 1.0);
                     
-                    }
-                    
-                    // 从颜色纹理采样
                     vec4 color = texture2D(u_colorTexture, vec2(normalizedValueForColor, 0.5));
                     
                     gl_FragColor = vec4(color.rgb, color.a * u_opacity);
@@ -426,7 +449,8 @@ export function registerWebGLScalarLayer(L) {
                 nodata: gl.getUniformLocation(this._program, 'u_nodata'),
                 numRange: gl.getUniformLocation(this._program, 'u_numRange'),
                 showColor: gl.getUniformLocation(this._program, 'u_showColor'),
-                useFloatTexture: gl.getUniformLocation(this._program, 'u_useFloatTexture')
+                useFloatTexture: gl.getUniformLocation(this._program, 'u_useFloatTexture'),
+                textureSize: gl.getUniformLocation(this._program, 'u_textureSize') 
             };
         },
 
@@ -446,7 +470,6 @@ export function registerWebGLScalarLayer(L) {
         },
 
         // 设置几何体
-// 设置几何体
         _setupGeometry: function() {
             const gl = this._gl;
 
@@ -500,12 +523,12 @@ export function registerWebGLScalarLayer(L) {
             }
             
             this._colorTexture = gl.createTexture();
-            console.log("colorTexture exists?", !!this._colorTexture);
+            // console.log("colorTexture exists?", !!this._colorTexture);
             gl.bindTexture(gl.TEXTURE_2D, this._colorTexture);
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, colorData);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); 
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
         },
 
@@ -540,7 +563,81 @@ export function registerWebGLScalarLayer(L) {
                 b: Math.round(color1.b + (color2.b - color1.b) * localT)
             };
         },
+        // ⭐️ 方法一：IDW 升采样核心函数
+        // 将此函数添加到您的 WebGLScalarLayer 类中
+        _upsampleGridIDW: function(grid, factor, power, neighbors) {
+            if (factor <= 1) return grid;
 
+            const oldRows = grid.length;
+            const oldCols = grid[0].length;
+            const newRows = Math.floor(oldRows * factor);
+            const newCols = Math.floor(oldCols * factor);
+
+            const newGrid = Array(newRows).fill(0).map(() => Array(newCols).fill(0));
+            const nodata = this.options.nodata;
+
+            for (let j = 0; j < newRows; j++) {
+                for (let i = 0; i < newCols; i++) {
+                    const old_i_float = i / factor;
+                    const old_j_float = j / factor;
+
+                    let totalValue = 0;
+                    let totalWeight = 0;
+                    let foundPoints = [];
+
+                    // 搜索邻近点（为了性能，我们只在一个小窗口内搜索）
+                    const searchRadius = Math.ceil(Math.sqrt(neighbors));
+                    const i_center = Math.round(old_i_float);
+                    const j_center = Math.round(old_j_float);
+
+                    for (let sy = -searchRadius; sy <= searchRadius; sy++) {
+                        for (let sx = -searchRadius; sx <= searchRadius; sx++) {
+                            const cx = i_center + sx;
+                            const cy = j_center + sy;
+
+                            if (cy >= 0 && cy < oldRows && cx >= 0 && cx < oldCols) {
+                                const val = grid[cy][cx];
+                                if (val !== nodata) {
+                                    const d = Math.sqrt(Math.pow(old_i_float - cx, 2) + Math.pow(old_j_float - cy, 2));
+                                    foundPoints.push({ dist: d, value: val });
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 如果找不到任何有效点，则使用最近邻
+                    if(foundPoints.length === 0){
+                        newGrid[j][i] = grid[Math.min(oldRows-1, j_center)][Math.min(oldCols-1, i_center)];
+                        continue;
+                    }
+
+                    // 排序并选取最近的 N 个点
+                    foundPoints.sort((a, b) => a.dist - b.dist);
+                    const nearestPoints = foundPoints.slice(0, neighbors);
+
+                    for(const p of nearestPoints){
+                        // 如果距离为0（完全重合），直接取该点的值
+                        if (p.dist === 0) {
+                            totalValue = p.value;
+                            totalWeight = 1;
+                            break;
+                        }
+                        const weight = 1.0 / Math.pow(p.dist, power);
+                        totalValue += weight * p.value;
+                        totalWeight += weight;
+                    }
+
+                    if (totalWeight > 0) {
+                        newGrid[j][i] = totalValue / totalWeight;
+                    } else {
+                        // 理论上不会进入这里，除非所有点距离都是无穷大
+                        newGrid[j][i] = nodata;
+                    }
+                }
+            }
+            // console.log(`🚀 Upsampled grid via IDW to ${newCols}x${newRows}`);
+            return newGrid;
+        },
         // 十六进制颜色转RGB
         _hexToRgb: function(hex) {
             const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
@@ -561,9 +658,9 @@ export function registerWebGLScalarLayer(L) {
             const height = data.length;
             const width = data[0].length;
             
-            console.log("🔍 开始创建纹理，数据维度:", width, "x", height);
-            console.log("🔍 原始数据样本:", data[0].slice(0, 5), "...", data[height-1].slice(0, 5));
-            console.log("🔍 数据范围:", this.minValue, "到", this.maxValue);
+            // console.log("🔍 开始创建纹理，数据维度:", width, "x", height);
+            // console.log("🔍 原始数据样本:", data[0].slice(0, 5), "...", data[height-1].slice(0, 5));
+            // console.log("🔍 数据范围:", this.minValue, "到", this.maxValue);
             
             let textureData, format, type;
             
@@ -597,16 +694,16 @@ export function registerWebGLScalarLayer(L) {
                     }
                 }
                 
-                console.log("🔍 浮点纹理统计:");
-                console.log("  - 有效数据点:", validCount);
-                console.log("  - 无效数据点:", invalidCount);
-                console.log("  - 平均值:", validCount > 0 ? (totalSum / validCount).toFixed(3) : "N/A");
-                console.log("  - 纹理数据前10个值:", Array.from(textureData.slice(0, 10)));
-                console.log("  - 纹理数据后10个值:", Array.from(textureData.slice(-10)));
+                // console.log("🔍 浮点纹理统计:");
+                // console.log("  - 有效数据点:", validCount);
+                // console.log("  - 无效数据点:", invalidCount);
+                // console.log("  - 平均值:", validCount > 0 ? (totalSum / validCount).toFixed(3) : "N/A");
+                // console.log("  - 纹理数据前10个值:", Array.from(textureData.slice(0, 10)));
+                // console.log("  - 纹理数据后10个值:", Array.from(textureData.slice(-10)));
                 
                 // 🔧 验证纹理数据是否全为无效值
                 const nonInvalidCount = Array.from(textureData).filter(v => v !== -9999.0).length;
-                console.log("  - 非无效值数量:", nonInvalidCount);
+                // console.log("  - 非无效值数量:", nonInvalidCount);
                 
             } else {
                 // 8位整数纹理路径
@@ -618,7 +715,7 @@ export function registerWebGLScalarLayer(L) {
                 const maxVal = this.maxValue;
                 const range = (maxVal - minVal) === 0 ? 1 : (maxVal - minVal);
                 
-                console.log("🔍 8位纹理标准化参数:", { minVal, maxVal, range });
+                // console.log("🔍 8位纹理标准化参数:", { minVal, maxVal, range });
                 
                 for (let i = 0; i < height; i++) {
                     for (let j = 0; j < width; j++) {
@@ -638,13 +735,13 @@ export function registerWebGLScalarLayer(L) {
                     }
                 }
                 
-                console.log("🔍 8位纹理数据前10个值:", Array.from(textureData.slice(0, 10)));
+                // console.log("🔍 8位纹理数据前10个值:", Array.from(textureData.slice(0, 10)));
             }
             
             // 🔧 关键修复：纹理创建前的WebGL状态检查
             if (!this._dataTexture) {
                 this._dataTexture = gl.createTexture();
-                console.log("🔍 创建新纹理对象:", !!this._dataTexture);
+                // console.log("🔍 创建新纹理对象:", !!this._dataTexture);
             }
             
             // 🔧 绑定前检查当前WebGL状态
@@ -657,11 +754,20 @@ export function registerWebGLScalarLayer(L) {
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, this._dataTexture);
             
-            // 🔧 关键修复：设置纹理参数BEFORE上传数据
+            // ⭐️ 关键修改：根据支持情况动态选择纹理过滤器
+            const filter = (this._useFloatTexture && this._canLinearFilterFloat) ? gl.LINEAR : gl.NEAREST;
+            
+            if (filter === gl.LINEAR) {
+                console.log('🚀 Using LINEAR filter for smooth rendering.');
+            } else {
+                console.log('🎨 Using NEAREST filter (blocky rendering).');
+            }
+
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); // 🔧 改为NEAREST避免插值
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+            
             
             try {
                 // 🔧 上传纹理数据
@@ -681,11 +787,11 @@ export function registerWebGLScalarLayer(L) {
                     return;
                 }
                 
-                console.log(`✅ 数据纹理上传成功: ${width}x${height}, 格式: ${this._useFloatTexture ? 'FLOAT' : 'UNSIGNED_BYTE'}`);
+                // console.log(`✅ 数据纹理上传成功: ${width}x${height}, 格式: ${this._useFloatTexture ? 'FLOAT' : 'UNSIGNED_BYTE'}`);
                 
                 // 🔧 验证纹理是否正确绑定
                 const boundTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
-                console.log("🔍 当前绑定的纹理:", boundTexture === this._dataTexture ? "正确" : "错误");
+                // console.log("🔍 当前绑定的纹理:", boundTexture === this._dataTexture ? "正确" : "错误");
                 
             } catch (e) {
                 console.error('🔥 纹理创建异常:', e);
@@ -716,7 +822,7 @@ export function registerWebGLScalarLayer(L) {
             this._canvas.height = canvasHeight;
             this._canvas.style.width = size.x + 'px';
             this._canvas.style.height = size.y + 'px';
-            console.log("canvas width height", this._canvas.width, this._canvas.height);
+            // console.log("canvas width height", this._canvas.width, this._canvas.height);
 
             // 更新 Label 画布大小 (这是解决模糊的关键)
             this._labelCanvas.width = canvasWidth;
@@ -737,7 +843,7 @@ export function registerWebGLScalarLayer(L) {
         _render: function() {
             // Early exit if not ready
             if (!this._gl || !this._program || !this.gridData || !this.dataBounds) {
-                console.log("🔥 _render aorted: Not ready.");
+                // console.log("🔥 _render aorted: Not ready.");
                 return;
             }
             
@@ -784,13 +890,15 @@ export function registerWebGLScalarLayer(L) {
             gl.uniform1f(this._locations.nodata, this.options.nodata);
             gl.uniform2f(this._locations.numRange, this.options.numRange[0], this.options.numRange[1]);
             gl.uniform1i(this._locations.showColor, this.options.showColor);
-
+            if (this._locations.textureSize) {
+                gl.uniform2f(this._locations.textureSize, this.nCols, this.nRows);
+                    }
             // Bind textures
             gl.activeTexture(gl.TEXTURE0);
             // ⭐️⭐️⭐️ 核心修正：将 gl.TEXTURE_D 改为 gl.TEXTURE_2D ⭐️⭐️⭐️
             gl.bindTexture(gl.TEXTURE_2D, this._dataTexture);
-            console.log("🔍 dataTexture存在:", !!this._dataTexture);
-            console.log("🔍 当前绑定的纹理:", gl.getParameter(gl.TEXTURE_BINDING_2D));
+            // console.log("🔍 dataTexture存在:", !!this._dataTexture);
+            // console.log("🔍 当前绑定的纹理:", gl.getParameter(gl.TEXTURE_BINDING_2D));
             gl.uniform1i(this._locations.dataTexture, 0);
 
             gl.activeTexture(gl.TEXTURE1);
@@ -798,7 +906,7 @@ export function registerWebGLScalarLayer(L) {
             gl.uniform1i(this._locations.colorTexture, 1);
 
             // Draw the quad
-            console.log("🔥 Drawing with pixel bounds:", pixelBounds);
+            // console.log("🔥 Drawing with pixel bounds:", pixelBounds);
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
             // Draw labels if needed
