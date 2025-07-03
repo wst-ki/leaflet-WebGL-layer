@@ -1,3 +1,18 @@
+import windImg1 from '../img/wind/1.png'
+import windImg2 from '../img/wind/2.png'
+import windImg3 from '../img/wind/3.png'
+import windImg4 from '../img/wind/4.png'
+import windImg5 from '../img/wind/5.png'
+import windImg6 from '../img/wind/6.png'
+import windImg7 from '../img/wind/7.png'
+import windImg8 from '../img/wind/8.png'
+import windImg9 from '../img/wind/9.png'
+import windImg10 from '../img/wind/10.png'
+import windImg11 from '../img/wind/11.png'
+import windImg12 from '../img/wind/12.png'
+import windImg13 from '../img/wind/13.png'
+import windImg14 from '../img/wind/14.png'
+import windImg15 from '../img/wind/15.png'
 export function createCanvasWindFeatherLayer(leaflet) {
     const CanvasWindFeatherLayer = leaflet.Layer.extend({
         includes: leaflet.Mixin.Events,
@@ -12,7 +27,7 @@ export function createCanvasWindFeatherLayer(leaflet) {
             // 【新增】颜色配置选项
             // color: 可以是 null, string, 或者 array.
             // null: 使用默认的基于风向的HSL色盘.
-            // string: e.g., 'rgb(255, 255, 255)' or 'white', 用于渲染所有风向杆的单色.
+            // string: e.g., 'rgb(220, 81, 81)' or 'white', 用于渲染所有风向杆的单色.
             // array: 一个 colorBar 数组，用于根据 colorProperty 的值进行颜色插值.
             color: null,
             // 【新增】用于颜色映射的属性
@@ -43,7 +58,9 @@ export function createCanvasWindFeatherLayer(leaflet) {
 
             this._drawWindFeathers();
         },
-
+        getContainer: function (){
+            return this._container;
+        },
         // 绘制风向杆
         _drawWindFeathers: function() {
             const canvas = this._canvas;
@@ -67,7 +84,7 @@ export function createCanvasWindFeatherLayer(leaflet) {
                 return;
             }
 
-            console.log("✅ 数据网格大小:", uData.length);
+            // console.log("✅ 数据网格大小:", uData.length);
             console.log("✅ 数据样本:", {
                 u: uData[0] ? uData[0][0] : 'undefined',
                 v: vData[0] ? vData[0][0] : 'undefined'
@@ -269,26 +286,26 @@ export function createCanvasWindFeatherLayer(leaflet) {
                 console.warn(`无效的颜色值，跳过在 (${x}, ${y}) 的绘制`);
                 return;
             }
-            console.log(`尝试绘制风向杆: 位置(${x}, ${y}), 等级${level}, 角度${angle}, 颜色RGB(${color.r}, ${color.g}, ${color.b})`);
+            // console.log(`尝试绘制风向杆: 位置(${x}, ${y}), 等级${level}, 角度${angle}, 颜色RGB(${color.r}, ${color.g}, ${color.b})`);
 
             const windImage = new Image();
 
             const windImages = {
-                1: './wind/1.png',
-                2: './wind/2.png',
-                3: './wind/3.png',
-                4: './wind/4.png',
-                5: './wind/5.png',
-                6: './wind/6.png',
-                7: './wind/7.png',
-                8: './wind/8.png',
-                9: './wind/9.png',
-                10: './wind/10.png',
-                11: './wind/11.png',
-                12: './wind/12.png',
-                13: './wind/13.png',
-                14: './wind/14.png',
-                15: './wind/15.png'
+                1: windImg1,
+                2:windImg2 ,
+                3:windImg3 ,
+                4: windImg4,
+                5:windImg5 ,
+                6:windImg6,
+                7:windImg7 ,
+                8:windImg8,
+                9:windImg9 ,
+                10: windImg10,
+                11:windImg11,
+                12: windImg12,
+                13: windImg13,
+                14:windImg14,
+                15: windImg15
             };
 
             if (!windImages[level]) {
@@ -296,7 +313,7 @@ export function createCanvasWindFeatherLayer(leaflet) {
             }
 
             windImage.src = windImages[level] || windImages[1];
-            console.log(`图片路径: ${windImage.src}`);
+            // console.log(`图片路径: ${windImage.src}`);
 
             // 添加图片加载错误处理
             windImage.onerror = () => {
@@ -319,7 +336,7 @@ export function createCanvasWindFeatherLayer(leaflet) {
             };
 
             windImage.onload = () => {
-                console.log(`✅ 图片加载成功: ${windImage.src}`);
+                // console.log(`✅ 图片加载成功: ${windImage.src}`);
 
                 // 检查绘制ID是否还有效
                 if (drawingId !== this.drawingId) {
@@ -332,7 +349,7 @@ export function createCanvasWindFeatherLayer(leaflet) {
                 const imageWidth = windImage.width * scale;
                 const imageHeight = windImage.height * scale;
 
-                console.log(`绘制图片尺寸: ${imageWidth} x ${imageHeight}`);
+                // console.log(`绘制图片尺寸: ${imageWidth} x ${imageHeight}`);
 
                 // 移动到绘制位置并旋转
                 context.translate(x, y);
@@ -370,7 +387,7 @@ export function createCanvasWindFeatherLayer(leaflet) {
                 context.drawImage(tempCanvas, -imageWidth / 2, -imageHeight / 2);
 
                 context.restore();
-                console.log(`✅ 风向杆绘制完成在位置 (${x}, ${y})，颜色 RGB(${color.r}, ${color.g}, ${color.b})`);
+                // console.log(`✅ 风向杆绘制完成在位置 (${x}, ${y})，颜色 RGB(${color.r}, ${color.g}, ${color.b})`);
             };
         },
 
@@ -563,13 +580,27 @@ export function createCanvasWindFeatherLayer(leaflet) {
         },
 
         // 添加到地图
+        // 添加到地图 (REPLACE THIS ENTIRE FUNCTION)
         onAdd: function(map) {
             this._map = map;
+
+            // This if block should only initialize the canvas, not add it to a pane.
             if (!this._container) {
                 this._initCanvas();
             }
-            map._panes.overlayPane.appendChild(this._container);
 
+            // This logic MUST be outside the if block to work correctly when toggling layers.
+            const targetPane = this.options.pane ? map.getPane(this.options.pane) : map.getPanes().overlayPane;
+
+            // This is the SAFE and ONLY place we add the container to the map.
+            if (targetPane) {
+                targetPane.appendChild(this._container);
+            } else {
+                console.error(`FATAL: The pane "${this.options.pane}" does not exist on the map. The layer cannot be displayed.`);
+                // If the pane doesn't exist, we stop here to prevent a crash.
+                return; 
+            }
+            
             // 绑定地图事件
             map.on("zoomstart", this._clearCanvas, this);
             map.on("moveend", this._resetCanvas, this);
@@ -581,14 +612,21 @@ export function createCanvasWindFeatherLayer(leaflet) {
         },
 
         // 从地图移除
-        onRemove: function(map) {
-            map.getPanes().overlayPane.removeChild(this._container);
-            map.off("zoomstart", this._clearCanvas, this);
-            map.off("moveend", this._resetCanvas, this);
-            if (map.options.zoomAnimation) {
-                map.off("zoomanim", this._animateZoom, this);
-            }
-        },
+    onRemove: function(map) {
+        // 1. ✅ 核心修正：
+        //    不再写死从哪个 Pane 移除。
+        //    而是检查 _container 是否有父节点，如果有，就从父节点中移除自己。
+        if (this._container && this._container.parentNode) {
+            this._container.parentNode.removeChild(this._container);
+        }
+
+        // 2. 解绑所有地图事件
+        map.off("zoomstart", this._clearCanvas, this);
+        map.off("moveend", this._resetCanvas, this);
+        if (map.options.zoomAnimation) {
+            map.off("zoomanim", this._animateZoom, this);
+        }
+    },
 
         // 添加到地图的便捷方法
         addTo: function(map) {

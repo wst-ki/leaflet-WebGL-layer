@@ -7,9 +7,9 @@
  *
  * It does not perform any WebGL rendering.
  */
-export function createWebGLLabelLayer(L) {
+export function ceateWebGLLabelLayer(L) {
 
-    L.ScalarLabelLayer = L.Layer.extend({
+    const WebGLLabelLayer = L.Layer.extend({
         // Default options
         options: {
             zIndex: 10,         // Labels should typically be on top
@@ -82,14 +82,16 @@ export function createWebGLLabelLayer(L) {
                 this._resetCanvas();
             }
         },
-
+        getContainer: function (){
+            return this._container;
+        },
         // Leaflet layer lifecycle methods
         onAdd: function(map) {
             this._map = map;
             this._initCanvas();
             
-            // Add to the map pane
-            map.getPanes().overlayPane.appendChild(this._canvas);
+            // const targetPane = map.getPane('labelPane') || map.getPanes().overlayPane;
+            targetPane.appendChild(this._canvas);
             
             // Listen to map events
             map.on('moveend', this._resetCanvas, this);
@@ -99,13 +101,26 @@ export function createWebGLLabelLayer(L) {
         },
 
         onRemove: function(map) {
+            // FIX: Remove the canvas element from the DOM
             if (this._canvas && this._canvas.parentNode) {
                 this._canvas.parentNode.removeChild(this._canvas);
             }
+            
+            // Unbind events
             map.off('moveend', this._resetCanvas, this);
             map.off('zoomend', this._resetCanvas, this);
-        },
 
+            // FIX: Corrected typo from 'octions' to 'options'
+            if (map.options.zoomAnimation){
+                map.off('zoomanim', this._animateZoom, this)
+            }
+        },
+        setZIndex: function(zIndex) {
+            this.options.zIndex = zIndex;
+            if (this._canvas) {
+                this._canvas.style.zIndex = zIndex;
+            }
+        },
         // Canvas management
         _initCanvas: function() {
             this._canvas = L.DomUtil.create('canvas', 'leaflet-scalar-label-layer');
@@ -214,12 +229,7 @@ export function createWebGLLabelLayer(L) {
             
             return L.latLngBounds(L.latLng(south, west), L.latLng(north, east));
         },
-        setZIndex: function(zIndex) {
-            this.options.zIndex = zIndex;
-            if (this._canvas) {
-                this._canvas.style.zIndex = zIndex;
-            }
-        },
+
         // Public methods to control options
         setShowLabel: function(show) {
             this.options.showLabel = show;
@@ -233,7 +243,9 @@ export function createWebGLLabelLayer(L) {
     });
 
     // Factory function
-    L.scalarLabelLayer = function(options) {
-        return new L.ScalarLabelLayer(options);
+    L.WebGLLabelLayer = function(options) {
+        return new WebGLLabelLayer(options);
     };
+
+    return WebGLLabelLayer;
 }
