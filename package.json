@@ -1,0 +1,34 @@
+{
+  "name": "leaflet-webgl-layer",
+  "version": "1.0.0",
+  "description": "A Leaflet plugin for rendering large datasets using WebGL, including wind fields,wind barb, scalar data, and labels.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wst-ki/leaflet-WebGL-layer.git"
+  },
+  "keywords": [
+    "leaflet",
+    "webgl",
+    "gl",
+    "plugin",
+    "layer",
+    "map",
+    "wind",
+    "label",
+    "scalar",
+    "gis",
+    "visualization",
+    "renderer",
+    "performance"
+  ],
+  "author": "https://github.com/wst-ki",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/wst-ki/leaflet-WebGL-layer/issues"
+  },
+  "homepage": "https://github.com/wst-ki/leaflet-WebGL-layer#readme"
+}

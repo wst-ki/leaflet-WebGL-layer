@@ -127,6 +127,8 @@ export function registerWebGLScalarLayer(L) {
         },
 
         // 计算数据的最小值和最大值
+
+        // 1. 修改 _calculateMinMax 方法，增加色带范围计算
         _calculateMinMax: function() {
             if (!this.gridData) return;
             
@@ -147,7 +149,27 @@ export function registerWebGLScalarLayer(L) {
             
             this.minValue = min;
             this.maxValue = max;
+            
+            // ⭐️ 新增：计算色带的实际范围
+            this._calculateColorBandRange();
         },
+                // 2. 新增方法：计算色带范围
+        _calculateColorBandRange: function() {
+            const colors = this.options.scalarColor;
+            if (!colors || colors.length === 0) {
+                this.colorBandMin = this.minValue;
+                this.colorBandMax = this.maxValue;
+                return;
+            }
+            
+            // 从色带配置中获取实际的数值范围
+            const sortedColors = colors.slice().sort((a, b) => a.value - b.value);
+            this.colorBandMin = sortedColors[0].value;
+            this.colorBandMax = sortedColors[sortedColors.length - 1].value;
+            
+            console.log(`🎨 色带范围: ${this.colorBandMin} 到 ${this.colorBandMax}`);
+        },
+        
         // 计算网格参数（基于 leaflet-canvas-field 的方法）
         _calculateGridParameters: function() {
             if (!this.gridData || !this.dataBounds) return;
@@ -205,7 +227,8 @@ export function registerWebGLScalarLayer(L) {
             this._createShaders();
             this._setupGeometry();
             this._generateColorTexture();
-            
+            const targetPane = this.options.pane ? map.getPane(this.options.pane) : map.getPanes().overlayPane;
+            targetPane.appendChild(this._container);
             // 添加到地图容器
             map._panes.overlayPane.appendChild(this._container);
             
@@ -337,7 +360,8 @@ export function registerWebGLScalarLayer(L) {
                 uniform sampler2D u_dataTexture;
                 uniform sampler2D u_colorTexture;
                 uniform vec2 u_textureSize; // ⭐️ 新增：数据纹理的尺寸（宽、高）
-
+                uniform float u_colorBandMin;    // ⭐️ 新增
+                uniform float u_colorBandMax;    // ⭐️ 新增
                 uniform float u_opacity;
                 uniform float u_minValue;
                 uniform float u_maxValue;
@@ -405,9 +429,10 @@ export function registerWebGLScalarLayer(L) {
                         return;
                     }
                     
-                    float rangeForColor = u_maxValue - u_minValue;
+                    // ⭐️ 修改：使用色带的绝对值范围进行映射
+                    float rangeForColor = u_colorBandMax - u_colorBandMin;
                     if (rangeForColor <= 0.001) { rangeForColor = 1.0; }
-                    float normalizedValueForColor = clamp((value - u_minValue) / rangeForColor, 0.0, 1.0);
+                    float normalizedValueForColor = clamp((value - u_colorBandMin) / rangeForColor, 0.0, 1.0);
                     
                     vec4 color = texture2D(u_colorTexture, vec2(normalizedValueForColor, 0.5));
                     
@@ -450,7 +475,9 @@ export function registerWebGLScalarLayer(L) {
                 numRange: gl.getUniformLocation(this._program, 'u_numRange'),
                 showColor: gl.getUniformLocation(this._program, 'u_showColor'),
                 useFloatTexture: gl.getUniformLocation(this._program, 'u_useFloatTexture'),
-                textureSize: gl.getUniformLocation(this._program, 'u_textureSize') 
+                textureSize: gl.getUniformLocation(this._program, 'u_textureSize'),
+                colorBandMin: gl.getUniformLocation(this._program, 'u_colorBandMin'),
+                colorBandMax: gl.getUniformLocation(this._program, 'u_colorBandMax'),
             };
         },
 
@@ -503,6 +530,7 @@ export function registerWebGLScalarLayer(L) {
 
 
         // 生成颜色纹理
+        // 4. 修改 _generateColorTexture 方法，使用绝对值范围
         _generateColorTexture: function() {
             const gl = this._gl;
             const colors = this.options.scalarColor;
@@ -512,9 +540,15 @@ export function registerWebGLScalarLayer(L) {
             // 对颜色进行排序
             const sortedColors = colors.slice().sort((a, b) => a.value - b.value);
             
+            // ⭐️ 修改：使用色带的绝对值范围
+            const colorMin = sortedColors[0].value;
+            const colorMax = sortedColors[sortedColors.length - 1].value;
+            const colorRange = colorMax - colorMin;
+            
             for (let i = 0; i < width; i++) {
-                const t = i / (width - 1);
-                const color = this._interpolateColor(sortedColors, t);
+                // 将纹理索引映射到色带的绝对值范围
+                const absoluteValue = colorMin + (i / (width - 1)) * colorRange;
+                const color = this._interpolateColor(sortedColors, absoluteValue);
                 
                 colorData[i * 4] = color.r;
                 colorData[i * 4 + 1] = color.g;
@@ -523,7 +557,6 @@ export function registerWebGLScalarLayer(L) {
             }
             
             this._colorTexture = gl.createTexture();
-            // console.log("colorTexture exists?", !!this._colorTexture);
             gl.bindTexture(gl.TEXTURE_2D, this._colorTexture);
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, colorData);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -533,29 +566,38 @@ export function registerWebGLScalarLayer(L) {
         },
 
         // 颜色插值
+        // 3. 修改 _interpolateColor 方法，使用绝对值而不是归一化值
         _interpolateColor: function(colors, t) {
             if (colors.length === 0) return { r: 0, g: 0, b: 0 };
             if (colors.length === 1) return this._hexToRgb(colors[0].color);
             
-            // ⭐️ 修正：确保 t 在 [0, 1] 范围内
-            t = Math.max(0, Math.min(1, t));
+            // ⭐️ 修改：t 现在是绝对值，不再是归一化的 [0,1] 值
+            const sortedColors = colors.slice().sort((a, b) => a.value - b.value);
             
-            // 找到插值区间 - 基于归一化的 t 值
+            // 如果 t 超出色带范围，返回边界颜色
+            if (t <= sortedColors[0].value) {
+                return this._hexToRgb(sortedColors[0].color);
+            }
+            if (t >= sortedColors[sortedColors.length - 1].value) {
+                return this._hexToRgb(sortedColors[sortedColors.length - 1].color);
+            }
+            
+            // 找到 t 所在的色带区间
             let i = 0;
-            while (i < colors.length - 1 && t > colors[i + 1].value) {
+            while (i < sortedColors.length - 1 && t > sortedColors[i + 1].value) {
                 i++;
             }
             
-            if (i === colors.length - 1) {
-                return this._hexToRgb(colors[i].color);
+            if (i === sortedColors.length - 1) {
+                return this._hexToRgb(sortedColors[i].color);
             }
             
-            const color1 = this._hexToRgb(colors[i].color);
-            const color2 = this._hexToRgb(colors[i + 1].color);
+            const color1 = this._hexToRgb(sortedColors[i].color);
+            const color2 = this._hexToRgb(sortedColors[i + 1].color);
             
-            // ⭐️ 修正：确保除法不会出错
-            const valueDiff = colors[i + 1].value - colors[i].value;
-            const localT = valueDiff === 0 ? 0 : (t - colors[i].value) / valueDiff;
+            // 计算在当前区间内的插值位置
+            const valueDiff = sortedColors[i + 1].value - sortedColors[i].value;
+            const localT = valueDiff === 0 ? 0 : (t - sortedColors[i].value) / valueDiff;
             
             return {
                 r: Math.round(color1.r + (color2.r - color1.r) * localT),
@@ -882,7 +924,8 @@ export function registerWebGLScalarLayer(L) {
             // === Set Uniforms ===
             gl.uniform2f(this._locations.resolution, canvasResolution[0], canvasResolution[1]);
             gl.uniform4f(this._locations.pixelBounds, pixelBounds.minX, pixelBounds.minY, pixelBounds.maxX, pixelBounds.maxY);
-
+            gl.uniform1f(this._locations.colorBandMin, this.colorBandMin || this.minValue);
+            gl.uniform1f(this._locations.colorBandMax, this.colorBandMax || this.maxValue);
             gl.uniform1i(this._locations.useFloatTexture, this._useFloatTexture);
             gl.uniform1f(this._locations.opacity, this.options.opacity);
             gl.uniform1f(this._locations.minValue, this.minValue);
@@ -1072,6 +1115,7 @@ export function registerWebGLScalarLayer(L) {
 
         setScalarColor: function(colors) {
             this.options.scalarColor = colors;
+            this._calculateColorBandRange(); // ⭐️ 新增：重新计算色带范围
             this._generateColorTexture();
             this._render();
         },
