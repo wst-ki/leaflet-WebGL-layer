@@ -28,7 +28,17 @@ export function createWebGLWindFeatherLayer(leaflet) {
                 this._resetAndDraw();
             }
         },
+        setZIndex: function(zIndex) {
+            this.options.zIndex = zIndex;
+            if (this._container) {
+                this._container.style.zIndex = zIndex;
+            }
+            return this;
+        },
 
+        getZIndex: function() {
+            return this.options.zIndex;
+        },
         // -----------------------------------------------------------------
         //  Core Leaflet Layer Methods (Unchanged)
         // -----------------------------------------------------------------
@@ -97,6 +107,7 @@ export function createWebGLWindFeatherLayer(leaflet) {
             } else {
                 this._drawWindFeathers();
             }
+            this._drawWindFeathers();
         },
         
         _initWebGL: function() {

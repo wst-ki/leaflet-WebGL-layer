@@ -4,7 +4,7 @@ export function registerWebGLScalarLayer(L) {
     L.WebGLScalarLayer = L.Layer.extend({
         // 默认选项
         options: {
-            zIndex: 0,
+            zIndex: 1,
             showLabel: false,
             showColor: true,
             opacity: 1.0,
@@ -227,10 +227,9 @@ export function registerWebGLScalarLayer(L) {
             this._createShaders();
             this._setupGeometry();
             this._generateColorTexture();
+            
             const targetPane = this.options.pane ? map.getPane(this.options.pane) : map.getPanes().overlayPane;
             targetPane.appendChild(this._container);
-            // 添加到地图容器
-            map._panes.overlayPane.appendChild(this._container);
             
             // 监听地图事件
             map.on('zoom', this._onMapChange, this);
@@ -257,8 +256,9 @@ export function registerWebGLScalarLayer(L) {
         _initCanvas: function() {
             this._container = L.DomUtil.create('div', 'leaflet-webgl-scalar-layer');
             this._container.style.position = 'absolute';
-            this._container.style.zIndex = this.options.zIndex;
-            
+            if (this.options.zIndex !== undefined) {
+                    this._container.style.zIndex = this.options.zIndex;
+                }
             // WebGL 画布
             this._canvas = L.DomUtil.create('canvas', '');
             this._canvas.style.position = 'absolute';
@@ -880,15 +880,17 @@ export function registerWebGLScalarLayer(L) {
         },
 
         // 渲染
-// ⭐️ REVISED RENDER FUNCTION ⭐️
-// ⭐️ REVISED RENDER FUNCTION (CORRECTED) ⭐️
+        // ⭐️ REVISED RENDER FUNCTION ⭐️
+        // ⭐️ REVISED RENDER FUNCTION (CORRECTED) ⭐️
         _render: function() {
             // Early exit if not ready
             if (!this._gl || !this._program || !this.gridData || !this.dataBounds) {
                 // console.log("🔥 _render aorted: Not ready.");
                 return;
             }
-            
+            if (this._labelCtx) {
+                this._labelCtx.clearRect(0, 0, this._labelCanvas.width, this._labelCanvas.height);
+            }
             const gl = this._gl;
             const mapSize = this._map.getSize(); // Canvas CSS size
             const pixelRatio = window.devicePixelRatio || 1;
@@ -1090,12 +1092,29 @@ export function registerWebGLScalarLayer(L) {
 
             return Math.min(1, intersectionArea / mapArea);
         },
+        // ADD THIS METHOD
+        setZIndex: function(zIndex) {
+            this.options.zIndex = zIndex;
+            if (this._container) {
+                this._container.style.zIndex = zIndex;
+            }
+            return this;
+        },
+
+        getZIndex: function() {
+            return this.options.zIndex;
+        },
         // 设置标签密度
         setLabelDensity: function(density) {
         this.options.labelDensity = Math.max(0.1, density); // 最小值限制
             if (this.options.showLabel) {
                 this._render();
             }
+        },
+                // ⭐️ 新增一个公共的 redraw 方法 ⭐️
+        redraw: function() {
+            this._render();
+            return this;
         },
         // 设置选项的方法
         setOpacity: function(opacity) {

@@ -15,9 +15,9 @@ export function ceateWebGLLabelLayer(L) {
             zIndex: 10,         // Labels should typically be on top
             showLabel: true,    // Default to true for a label layer
             digit: 1,           // Number of decimal places for the label
-            maxLabels: 300,     // Maximum number of labels to draw
-            labelDensity: 1.5,  // Density factor (larger value means sparser labels)
-            fontSize: 12,       // Font size in pixels
+            maxLabels: 30000,     // Maximum number of labels to draw
+            labelDensity: 2,  // Density factor (larger value means sparser labels)
+            fontSize: 20,       // Font size in pixels
             fontColor: 'black', // Color of the label text
             haloColor: 'white', // Color of the text halo (outline)
             haloWidth: 2.5      // Width of the text halo
@@ -82,45 +82,79 @@ export function ceateWebGLLabelLayer(L) {
                 this._resetCanvas();
             }
         },
+        
         getContainer: function (){
             return this._container;
         },
+        
         // Leaflet layer lifecycle methods
         onAdd: function(map) {
             this._map = map;
             this._initCanvas();
             
-            // const targetPane = map.getPane('labelPane') || map.getPanes().overlayPane;
-            targetPane.appendChild(this._canvas);
+            // 获取目标面板
+            const targetPane = this.options.pane ? map.getPane(this.options.pane) : map.getPanes().overlayPane;
+            
+            // 创建容器并添加到目标面板
+            this._container = L.DomUtil.create('div', 'leaflet-webgl-label-layer');
+            this._container.style.position = 'absolute';
+            this._container.style.top = '0';
+            this._container.style.left = '0';
+            this._container.style.zIndex = this.options.zIndex;
+            this._container.style.pointerEvents = 'none';
+            
+            // 将 canvas 添加到容器
+            this._container.appendChild(this._canvas);
+            
+            // 将容器添加到目标面板
+            targetPane.appendChild(this._container);
             
             // Listen to map events
             map.on('moveend', this._resetCanvas, this);
             map.on('zoomend', this._resetCanvas, this);
             
+            // 如果支持缩放动画，添加相应的事件监听
+            if (map.options.zoomAnimation) {
+                map.on('zoomanim', this._animateZoom, this);
+            }
+            
             this._resetCanvas();
         },
+        
+        setZIndex: function(zIndex) {
+            this.options.zIndex = zIndex;
+            if (this._container) {
+                this._container.style.zIndex = zIndex;
+            }
+            return this;
+        },
 
+        getZIndex: function() {
+            return this.options.zIndex;
+        },
+        
         onRemove: function(map) {
-            // FIX: Remove the canvas element from the DOM
-            if (this._canvas && this._canvas.parentNode) {
-                this._canvas.parentNode.removeChild(this._canvas);
+            // Remove the container from the DOM
+            if (this._container && this._container.parentNode) {
+                this._container.parentNode.removeChild(this._container);
             }
             
             // Unbind events
             map.off('moveend', this._resetCanvas, this);
             map.off('zoomend', this._resetCanvas, this);
 
-            // FIX: Corrected typo from 'octions' to 'options'
+            // Corrected typo from 'octions' to 'options'
             if (map.options.zoomAnimation){
-                map.off('zoomanim', this._animateZoom, this)
+                map.off('zoomanim', this._animateZoom, this);
             }
+            
+            // Clean up references
+            this._map = null;
+            this._canvas = null;
+            this._ctx = null;
+            this._container = null;
         },
-        setZIndex: function(zIndex) {
-            this.options.zIndex = zIndex;
-            if (this._canvas) {
-                this._canvas.style.zIndex = zIndex;
-            }
-        },
+
         // Canvas management
         _initCanvas: function() {
             this._canvas = L.DomUtil.create('canvas', 'leaflet-scalar-label-layer');
@@ -233,12 +267,72 @@ export function ceateWebGLLabelLayer(L) {
         // Public methods to control options
         setShowLabel: function(show) {
             this.options.showLabel = show;
-            this._resetCanvas();
+            // 立即重绘，而不是等待地图事件
+            if (this._map) {
+                this._drawLabels();
+            }
         },
         
         setLabelDensity: function(density) {
             this.options.labelDensity = Math.max(0.1, density);
-            this._resetCanvas();
+            // 立即重绘，而不是等待地图事件
+            if (this._map) {
+                this._drawLabels();
+            }
+        },
+        
+        // 新增：设置字体大小的方法
+        setFontSize: function(fontSize) {
+            this.options.fontSize = Math.max(8, fontSize); // 最小字体大小限制为8px
+            // 立即重绘以应用新的字体大小
+            if (this._map) {
+                this._drawLabels();
+            }
+        },
+        
+        // 新增：获取当前字体大小
+        getFontSize: function() {
+            return this.options.fontSize;
+        },
+        
+        // 新增：设置字体颜色的方法
+        setFontColor: function(color) {
+            this.options.fontColor = color;
+            if (this._map) {
+                this._drawLabels();
+            }
+        },
+        
+        // 新增：设置光晕颜色的方法
+        setHaloColor: function(color) {
+            this.options.haloColor = color;
+            if (this._map) {
+                this._drawLabels();
+            }
+        },
+        
+        // 新增：设置光晕宽度的方法
+        setHaloWidth: function(width) {
+            this.options.haloWidth = Math.max(0, width);
+            if (this._map) {
+                this._drawLabels();
+            }
+        },
+        
+        // 新增：设置小数位数的方法
+        setDigit: function(digit) {
+            this.options.digit = Math.max(0, Math.min(10, digit)); // 限制在0-10之间
+            if (this._map) {
+                this._drawLabels();
+            }
+        },
+        
+        // 新增：强制重绘方法
+        redraw: function() {
+            if (this._map) {
+                this._drawLabels();
+            }
+            return this;
         }
     });
 

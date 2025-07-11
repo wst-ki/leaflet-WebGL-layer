@@ -2,9 +2,10 @@
  * WebGLWindLayer.js
  * 修复粒子拖尾闪烁问题和位置绘制问题的版本
  * 新增功能：支持自定义粒子颜色和大小
+ * 修复：解决了地图缩放/平移后留下渲染痕迹的问题
  */
 
-// --- GLSL 着色器源码 ---
+// --- GLSL 着色器源码 (无变化) ---
 
 const QUAD_VERTEX_SHADER = `#version 300 es
     in vec2 a_pos;
@@ -29,17 +30,13 @@ const SCREEN_FRAGMENT_SHADER = `#version 300 es
 
 const DRAW_VERTEX_SHADER = `#version 300 es
     precision mediump float;
-
     uniform mat3 u_matrix;
     uniform sampler2D u_particles;
     uniform float u_particle_res;
-    uniform float u_particle_size; // 新增：粒子大小
-
+    uniform float u_particle_size;
     in float a_index;
     out vec2 v_particle_pos;
-
     #define PI 3.141592653589793
-
     vec2 project(vec2 lonlat) {
         float lon_rad = radians(lonlat.x);
         float lat_rad = radians(lonlat.y);
@@ -48,66 +45,49 @@ const DRAW_VERTEX_SHADER = `#version 300 es
             log(tan(PI / 4.0 + lat_rad / 2.0))
         );
     }
-
     void main() {
         vec4 color = texture(u_particles, vec2(
             fract(a_index / u_particle_res),
             floor(a_index / u_particle_res) / u_particle_res
         ));
-        
         v_particle_pos = color.xy;
-        
         vec2 projected_pos = project(v_particle_pos);
-        
         vec3 transformed = u_matrix * vec3(projected_pos, 1.0);
         gl_Position = vec4(transformed.xy, 0.0, 1.0);
-        gl_PointSize = u_particle_size; // 修改：使用 uniform 变量
+        gl_PointSize = u_particle_size;
     }
 `;
 
 const DRAW_FRAGMENT_SHADER = `#version 300 es
     precision mediump float;
-
     uniform sampler2D u_wind;
     uniform vec2 u_wind_min;
     uniform vec2 u_wind_max;
-
-    // 新增：颜色相关的 uniforms
     uniform vec3 u_color1;
     uniform vec3 u_color2;
-    uniform float u_is_gradient; // 用 float 模拟 bool (1.0 for true, 0.0 for false)
-
+    uniform float u_is_gradient;
     in vec2 v_particle_pos;
     out vec4 outColor;
-
-    // 移除旧的 getColorRamp 函数
-
     void main() {
         vec2 tex_coord = (v_particle_pos - u_wind_min) / (u_wind_max - u_wind_min);
-        
         if (tex_coord.x < 0.0 || tex_coord.x > 1.0 || tex_coord.y < 0.0 || tex_coord.y > 1.0) {
             discard;
         }
-        
         vec2 wind = texture(u_wind, tex_coord).rg;
         float speed = length(wind);
         float normalized_speed = clamp(speed / 15.0, 0.0, 1.0);
-        
         vec3 final_color;
-        // 修改：根据 uniform 决定颜色计算方式
         if (u_is_gradient > 0.5) {
             final_color = mix(u_color1, u_color2, normalized_speed);
         } else {
             final_color = u_color1;
         }
-        
         outColor = vec4(final_color, 0.8);
     }
 `;
 
 const UPDATE_FRAGMENT_SHADER = `#version 300 es
     precision highp float;
-
     uniform sampler2D u_particles;
     uniform sampler2D u_wind;
     uniform vec2 u_wind_min;
@@ -115,20 +95,15 @@ const UPDATE_FRAGMENT_SHADER = `#version 300 es
     uniform float u_speed_factor;
     uniform float u_drop_rate;
     uniform float u_rand_seed;
-
     in vec2 v_tex_pos;
     out vec4 outColor;
-
     float rand(vec2 co) {
         return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453 + u_rand_seed);
     }
-
     void main() {
         vec4 state = texture(u_particles, v_tex_pos);
         vec2 pos = state.xy;
-        
         vec2 tex_coord = (pos - u_wind_min) / (u_wind_max - u_wind_min);
-        
         if (tex_coord.x < 0.0 || tex_coord.x > 1.0 || tex_coord.y < 0.0 || tex_coord.y > 1.0 || rand(v_tex_pos) < u_drop_rate) {
             pos = vec2(
                 u_wind_min.x + rand(v_tex_pos) * (u_wind_max.x - u_wind_min.x),
@@ -140,7 +115,6 @@ const UPDATE_FRAGMENT_SHADER = `#version 300 es
             pos.x += wind.x * u_speed_factor / cos(lat_rad);
             pos.y += wind.y * u_speed_factor;
         }
-        
         outColor = vec4(pos, 0.0, 1.0);
     }
 `;
@@ -156,9 +130,9 @@ export function registerWebGLWindLayer(L) {
             speedFactor: 0.8,
             dropRate: 0.003,
             fadeOpacity: 0.96,
-            // 新增：样式选项
             particleSize: 2.0,
-            color: ['#00FFFF', '#FF0000'] // 默认从青色到红色的渐变
+            zIndex: 1,
+            color: ['#00FFFF', '#FF0000']
         },
 
         initialize: function(windData, options) {
@@ -169,13 +143,17 @@ export function registerWebGLWindLayer(L) {
             this._buffers = {};
             this._framebuffers = {};
             this._matrix = new Float32Array(9);
-            this._processColorOption(); // 初始化时处理颜色
+            this._processColorOption();
         },
 
         onAdd: function(map) {
             this._map = map;
             this._canvas = L.DomUtil.create('canvas', 'leaflet-wind-layer leaflet-layer');
-            this.getPane().appendChild(this._canvas);
+            if (this.options.zIndex !== undefined) {
+                this._canvas.style.zIndex = this.options.zIndex;
+            }
+            const targetPane = this.options.pane ? map.getPane(this.options.pane) : map.getPanes().overlayPane;
+            targetPane.appendChild(this._canvas);
 
             const gl = this._canvas.getContext('webgl2', { 
                 antialias: false,
@@ -213,7 +191,6 @@ export function registerWebGLWindLayer(L) {
             }
         },
 
-        // --- 新增公共方法 ---
         setColor: function(color) {
             this.options.color = color;
             this._processColorOption();
@@ -224,7 +201,17 @@ export function registerWebGLWindLayer(L) {
             this.options.particleSize = size;
             return this;
         },
-        // --- ---
+        setZIndex: function(zIndex) {
+            this.options.zIndex = zIndex;
+            if (this._canvas) {
+                this._canvas.style.zIndex = zIndex;
+            }
+            return this;
+        },
+
+        getZIndex: function() {
+            return this.options.zIndex;
+        },
 
         _initGL: function() {
             const gl = this._gl;
@@ -265,7 +252,6 @@ export function registerWebGLWindLayer(L) {
             this._updateMatrix();
             gl.uniformMatrix3fv(program.u_matrix, false, this._matrix);
 
-            // 新增：传递样式 uniforms
             gl.uniform1f(program.u_particle_size, this.options.particleSize);
             gl.uniform3fv(program.u_color1, this._color1);
             gl.uniform3fv(program.u_color2, this._color2);
@@ -275,7 +261,6 @@ export function registerWebGLWindLayer(L) {
             gl.disable(gl.BLEND);
         },
         
-        // 新增：处理颜色选项的内部函数
         _processColorOption: function() {
             function hexToRgb(hex) {
                 if (hex.startsWith('#')) hex = hex.substring(1);
@@ -290,7 +275,7 @@ export function registerWebGLWindLayer(L) {
             if (typeof colorOpt === 'string') {
                 this._isGradient = false;
                 this._color1 = hexToRgb(colorOpt);
-                this._color2 = [0, 0, 0]; // 未使用，但需要一个值
+                this._color2 = [0, 0, 0];
             } else if (Array.isArray(colorOpt)) {
                 if (colorOpt.length === 1) {
                     this._isGradient = false;
@@ -301,10 +286,10 @@ export function registerWebGLWindLayer(L) {
                     this._color1 = hexToRgb(colorOpt[0]);
                     this._color2 = hexToRgb(colorOpt[1]);
                 }
-            } else { // 默认回退
+            } else {
                 this._isGradient = true;
-                this._color1 = [0.0, 1.0, 1.0]; // Cyan
-                this._color2 = [1.0, 0.0, 0.0]; // Red
+                this._color1 = [0.0, 1.0, 1.0];
+                this._color2 = [1.0, 0.0, 0.0];
             }
         },
         
@@ -315,8 +300,6 @@ export function registerWebGLWindLayer(L) {
             const y = Math.log(Math.tan((Math.PI / 4) + (lat_rad / 2)));
             return [lon_rad, y];
         },
-
-        // --- 以下是未修改的函数 ---
 
         _draw: function() {
             const gl = this._gl;
@@ -520,9 +503,24 @@ export function registerWebGLWindLayer(L) {
             ]);
         },
 
+        // ⭐️ 核心修复：修改 _update 函数
         _update: function() {
             this._updateMatrix();
             this._resize();
+
+            // 在地图视图变化结束后，强制清除屏幕缓冲
+            if (this._gl) {
+                const gl = this._gl;
+                gl.bindFramebuffer(gl.FRAMEBUFFER, this._framebuffers.screen);
+                gl.clearColor(0, 0, 0, 0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+
+                gl.bindFramebuffer(gl.FRAMEBUFFER, this._framebuffers.temp);
+                gl.clearColor(0, 0, 0, 0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            }
         },
         
         _createProgram: function(vertSrc, fragSrc) {
